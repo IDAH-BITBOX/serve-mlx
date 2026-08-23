@@ -33,9 +33,10 @@ mode—the vision tower) remains in Unified Memory.
 - Apple Silicon Mac and macOS
 - Python 3.10 or newer
 - Disk space for the MLX checkpoint and SSD reads during inference
-- A supported MLX safetensors MoE checkpoint. The tested examples are:
-  - `mlx-community/Qwen3-30B-A3B-4bit`
+- A supported MLX safetensors MoE checkpoint. The primary example in this guide
+  is `mlx-community/Qwen3.6-35B-A3B-8bit`; the tested examples are:
   - `mlx-community/Qwen3.6-35B-A3B-8bit`
+  - `mlx-community/Qwen3-30B-A3B-4bit`
   - `mlx-community/gemma-4-26b-a4b-it-8bit`
 
 Large models can reside on SSD, but they are not zero-memory models: the
@@ -76,11 +77,11 @@ not copy model weights. Run it once for each model checkpoint:
 
 ```bash
 mlx-moe-stream prepare \
-  --model mlx-community/Qwen3-30B-A3B-4bit \
-  --output prepared-qwen3
+  --model mlx-community/Qwen3.6-35B-A3B-8bit \
+  --output prepared-qwen3.6-35b
 ```
 
-This creates `prepared-qwen3/manifest.json`. Keep the manifest next to the
+This creates `prepared-qwen3.6-35b/manifest.json`. Keep the manifest next to the
 checkpoint cache or in your project; it is small and is safe to recreate with
 the same checkpoint.
 
@@ -88,8 +89,8 @@ the same checkpoint.
 
 ```bash
 mlx-moe-stream serve \
-  --manifest prepared-qwen3/manifest.json \
-  --model-id qwen3-local \
+  --manifest prepared-qwen3.6-35b/manifest.json \
+  --model-id qwen3.6-35b-local \
   --resident-budget auto \
   --kv-cache auto
 ```
@@ -103,7 +104,7 @@ model shell and can take noticeably longer than later requests.
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3-local",
+    "model": "qwen3.6-35b-local",
     "messages": [{"role": "user", "content": "Explain sparse MoE routing in two sentences."}],
     "max_tokens": 128,
     "temperature": 0.2
@@ -129,7 +130,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="local")
 
 response = client.chat.completions.create(
-    model="qwen3-local",
+    model="qwen3.6-35b-local",
     messages=[{"role": "user", "content": "Give me three uses of MoE models."}],
     max_tokens=128,
 )
@@ -140,7 +141,7 @@ print(response.choices[0].message.content)
 
 ```python
 stream = client.chat.completions.create(
-    model="qwen3-local",
+    model="qwen3.6-35b-local",
     messages=[{"role": "user", "content": "Write a short haiku about SSDs."}],
     max_tokens=128,
     stream=True,
@@ -159,11 +160,11 @@ Prepare the model, install `[vlm]`, and start the server with `--vision`:
 ```bash
 mlx-moe-stream prepare \
   --model mlx-community/Qwen3.6-35B-A3B-8bit \
-  --output prepared-qwen3.6
+  --output prepared-qwen3.6-35b
 
 mlx-moe-stream serve \
-  --manifest prepared-qwen3.6/manifest.json \
-  --model-id qwen3.6-local \
+  --manifest prepared-qwen3.6-35b/manifest.json \
+  --model-id qwen3.6-35b-local \
   --vision \
   --kv-cache auto
 ```
@@ -176,7 +177,7 @@ not supported.
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-local",
+    "model": "qwen3.6-35b-local",
     "messages": [{
       "role": "user",
       "content": [
@@ -224,7 +225,7 @@ expect (prompt plus completion):
 
 ```bash
 mlx-moe-stream generate \
-  --manifest prepared-qwen3/manifest.json \
+  --manifest prepared-qwen3.6-35b/manifest.json \
   --prompt "Summarize this document..." \
   --max-tokens 512 \
   --kv-cache auto \
@@ -248,7 +249,7 @@ Switching models unloads the prior engine and loads the selected one.
 
 ```bash
 mlx-moe-stream serve \
-  --model qwen=prepared-qwen3.6/manifest.json \
+  --model qwen=prepared-qwen3.6-35b/manifest.json \
   --model gemma=prepared-gemma4/manifest.json \
   --model-id qwen \
   --vision \
@@ -268,7 +269,7 @@ model output into OpenAI-style `reasoning_content` and `tool_calls` fields.
 
 ```python
 response = client.chat.completions.create(
-    model="qwen3-local",
+    model="qwen3.6-35b-local",
     messages=[{"role": "user", "content": "What is the weather in Seoul?"}],
     tools=[{
         "type": "function",
@@ -299,7 +300,7 @@ Use `generate` for a direct text prompt without starting HTTP serving:
 
 ```bash
 mlx-moe-stream generate \
-  --manifest prepared-qwen3/manifest.json \
+  --manifest prepared-qwen3.6-35b/manifest.json \
   --prompt "Explain sparse MoE routing." \
   --max-tokens 64 \
   --resident-budget auto \
@@ -307,7 +308,8 @@ mlx-moe-stream generate \
 ```
 
 Use `trace` to inspect Qwen3-MoE router choices and `simulate` to examine
-expert-cache locality:
+expert-cache locality. `trace` currently targets the Qwen3-MoE family, so this
+separate example uses Qwen3-30B:
 
 ```bash
 mlx-moe-stream trace \

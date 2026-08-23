@@ -35,10 +35,11 @@ MoE 전문가 가중치가 머뭅니다.
 - 체크포인트 저장 및 추론 중 SSD 읽기를 위한 충분한 디스크 공간
 - 지원하는 MLX safetensors MoE 체크포인트
 
-테스트한 모델 예시는 다음과 같습니다.
+대표 예시는 `mlx-community/Qwen3.6-35B-A3B-8bit`입니다. 테스트한 모델은
+다음과 같습니다.
 
-- `mlx-community/Qwen3-30B-A3B-4bit`
 - `mlx-community/Qwen3.6-35B-A3B-8bit`
+- `mlx-community/Qwen3-30B-A3B-4bit`
 - `mlx-community/gemma-4-26b-a4b-it-8bit`
 
 ## 설치
@@ -76,18 +77,18 @@ mlx-moe-stream --help
 
 ```bash
 mlx-moe-stream prepare \
-  --model mlx-community/Qwen3-30B-A3B-4bit \
-  --output prepared-qwen3
+  --model mlx-community/Qwen3.6-35B-A3B-8bit \
+  --output prepared-qwen3.6-35b
 ```
 
-완료되면 `prepared-qwen3/manifest.json`이 생성됩니다.
+완료되면 `prepared-qwen3.6-35b/manifest.json`이 생성됩니다.
 
 ### 2. 로컬 서버 실행
 
 ```bash
 mlx-moe-stream serve \
-  --manifest prepared-qwen3/manifest.json \
-  --model-id qwen3-local \
+  --manifest prepared-qwen3.6-35b/manifest.json \
+  --model-id qwen3.6-35b-local \
   --resident-budget auto \
   --kv-cache auto
 ```
@@ -101,7 +102,7 @@ mlx-moe-stream serve \
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3-local",
+    "model": "qwen3.6-35b-local",
     "messages": [{"role": "user", "content": "sparse MoE routing을 두 문장으로 설명해줘."}],
     "max_tokens": 128,
     "temperature": 0.2
@@ -127,7 +128,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="local")
 
 response = client.chat.completions.create(
-    model="qwen3-local",
+    model="qwen3.6-35b-local",
     messages=[{"role": "user", "content": "MoE 모델의 용도 세 가지를 알려줘."}],
     max_tokens=128,
 )
@@ -138,7 +139,7 @@ print(response.choices[0].message.content)
 
 ```python
 stream = client.chat.completions.create(
-    model="qwen3-local",
+    model="qwen3.6-35b-local",
     messages=[{"role": "user", "content": "SSD에 관한 짧은 하이쿠를 써줘."}],
     max_tokens=128,
     stream=True,
@@ -157,11 +158,11 @@ for event in stream:
 ```bash
 mlx-moe-stream prepare \
   --model mlx-community/Qwen3.6-35B-A3B-8bit \
-  --output prepared-qwen3.6
+  --output prepared-qwen3.6-35b
 
 mlx-moe-stream serve \
-  --manifest prepared-qwen3.6/manifest.json \
-  --model-id qwen3.6-local \
+  --manifest prepared-qwen3.6-35b/manifest.json \
+  --model-id qwen3.6-35b-local \
   --vision \
   --kv-cache auto
 ```
@@ -173,7 +174,7 @@ mlx-moe-stream serve \
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-local",
+    "model": "qwen3.6-35b-local",
     "messages": [{
       "role": "user",
       "content": [
@@ -218,7 +219,7 @@ mlx-community/gemma-4-26b-a4b-it-8bit
 
 ```bash
 mlx-moe-stream generate \
-  --manifest prepared-qwen3/manifest.json \
+  --manifest prepared-qwen3.6-35b/manifest.json \
   --prompt "긴 문서를 요약해줘..." \
   --max-tokens 512 \
   --kv-cache auto \
@@ -242,7 +243,7 @@ mlx-moe-stream generate \
 
 ```bash
 mlx-moe-stream serve \
-  --model qwen=prepared-qwen3.6/manifest.json \
+  --model qwen=prepared-qwen3.6-35b/manifest.json \
   --model gemma=prepared-gemma4/manifest.json \
   --model-id qwen \
   --vision \
@@ -262,7 +263,7 @@ OpenAI 형태의 `reasoning_content`, `tool_calls`로 변환됩니다.
 
 ```python
 response = client.chat.completions.create(
-    model="qwen3-local",
+    model="qwen3.6-35b-local",
     messages=[{"role": "user", "content": "서울 날씨를 알려줘."}],
     tools=[{
         "type": "function",
@@ -292,7 +293,7 @@ print(response.choices[0].message.tool_calls)
 
 ```bash
 mlx-moe-stream generate \
-  --manifest prepared-qwen3/manifest.json \
+  --manifest prepared-qwen3.6-35b/manifest.json \
   --prompt "sparse MoE routing을 설명해줘." \
   --max-tokens 64 \
   --resident-budget auto \
@@ -300,7 +301,8 @@ mlx-moe-stream generate \
 ```
 
 Qwen3-MoE의 라우터 선택을 확인하려면 `trace`, expert-cache 지역성을 보려면
-`simulate`를 사용합니다.
+`simulate`를 사용합니다. 현재 `trace`는 Qwen3-MoE 계열 전용이므로, 이 별도
+예시에서는 Qwen3-30B를 사용합니다.
 
 ```bash
 mlx-moe-stream trace \
