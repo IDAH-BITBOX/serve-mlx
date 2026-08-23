@@ -292,6 +292,15 @@ is not a promise that every model can fit. In particular, a 35B model may have
 a non-expert shell too large for an 8 GiB or 16 GiB Mac. In that case M7 rejects
 the expert-cache plan instead of using swap and making the machine unresponsive.
 
+For the smallest sustained memory footprint, disable the resident expert cache
+entirely with `--resident-budget off`. Experts still stream from SSD and are
+materialized for the active layer, but are not retained afterward:
+
+```bash
+mlx-moe-stream serve --manifest prepared-qwen3.6-35b/manifest.json \
+  --resident-budget off --kv-cache 4bit --max-prompt-tokens 1024 --max-tokens 64
+```
+
 ## Multiple models
 
 Register several prepared manifests with IDs. This exposes all of them through

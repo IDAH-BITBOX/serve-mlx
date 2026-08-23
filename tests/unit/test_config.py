@@ -21,4 +21,6 @@ def test_parse_resident_budget_distinguishes_auto_from_no_cache():
     assert parse_resident_budget(None) == (None, False)
     assert parse_resident_budget("auto") == (None, True)
     assert parse_resident_budget("AUTO") == (None, True)
+    assert parse_resident_budget("off") == (None, False)
+    assert parse_resident_budget("disabled") == (None, False)
     assert parse_resident_budget("2GB") == (2_000_000_000, False)

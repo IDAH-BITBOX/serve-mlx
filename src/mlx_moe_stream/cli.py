@@ -93,8 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument(
         "--resident-budget",
         help=(
-            "enable the M4 byte-budgeted resident expert cache; use 'auto' for "
-            "the M7 safe working-set budget (for example 2GB, 2048MiB, or auto)"
+            "resident expert-cache capacity: auto, off, or a byte size (for example 2GB or 2048MiB)"
         ),
     )
     generate.add_argument(
@@ -185,7 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--resident-budget",
         default="auto",
-        help="M4/M7 expert-cache capacity (default: auto)",
+        help="M4/M7 expert-cache capacity: auto, off, or a byte size (default: auto)",
     )
     serve.add_argument(
         "--memory-safety-margin",

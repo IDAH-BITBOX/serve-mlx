@@ -283,6 +283,15 @@ mlx-moe-stream serve \
 Mac의 한계를 넘을 수 있습니다. 이 경우 M7은 swap으로 시스템 전체를 멈추게 하는
 대신 expert-cache 계획을 거부합니다.
 
+지속적으로 점유하는 메모리를 가장 작게 하려면 `--resident-budget off`로 resident
+expert cache를 완전히 끌 수 있습니다. expert는 여전히 SSD에서 읽고 활성 레이어에
+맞춰 materialize되지만, 이후에는 유지하지 않습니다.
+
+```bash
+mlx-moe-stream serve --manifest prepared-qwen3.6-35b/manifest.json \
+  --resident-budget off --kv-cache 4bit --max-prompt-tokens 1024 --max-tokens 64
+```
+
 ## 여러 모델 서빙하기
 
 여러 manifest를 ID로 등록할 수 있습니다. `/v1/models`에 모두 노출되지만, 통합

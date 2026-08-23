@@ -57,8 +57,11 @@ def parse_resident_budget(value: str | None) -> tuple[int | None, bool]:
 
     if value is None:
         return None, False
-    if value.lower() == "auto":
+    normalized = value.lower()
+    if normalized == "auto":
         return None, True
+    if normalized in {"off", "none", "disabled"}:
+        return None, False
     return parse_bytes(value), False
 
 
