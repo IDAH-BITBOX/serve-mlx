@@ -311,8 +311,9 @@ M12 supports `n=1` requests with this local OpenAI-compatible subset:
   `message.reasoning_content` (or `delta.reasoning_content` while streaming).
   `reasoning_effort: "none"` requests the template's no-thinking form.
 - Function `tools` and `tool_choice` use a tokenizer's tool-aware chat
-  template. Qwen XML tool calls become OpenAI `tool_calls`; the server never
-  executes a tool. Send a `role: "tool"` result in the next client request.
+  template. Qwen XML and Gemma native tool calls become OpenAI `tool_calls`;
+  the server never executes a tool. Send a `role: "tool"` result in the next
+  client request.
 - `response_format` supports `json_object` and `json_schema`, which are
   prompted and then validated locally with Draft 2020-12 JSON Schema.
   Structured responses use `stream=false` so invalid output is never committed

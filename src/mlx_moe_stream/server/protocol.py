@@ -372,7 +372,7 @@ def validate_structured_output(text: str, response_format: dict[str, Any] | None
 
 
 def split_reasoning(text: str, *, initial_reasoning: bool) -> tuple[str, str]:
-    """Return ``(reasoning_content, visible_content)`` from Qwen think tags."""
+    """Return ``(reasoning_content, visible_content)`` from Qwen/Gemma controls."""
 
     parser = ThinkingStreamParser(initial_reasoning=initial_reasoning)
     reasoning: list[str] = []
@@ -419,7 +419,17 @@ class StopSequenceBuffer:
 
 
 class ThinkingStreamParser:
-    """Split a model's incremental text into OpenAI reasoning/content deltas."""
+    """Split Qwen think and Gemma channel deltas into OpenAI fields."""
+
+    _MARKERS: tuple[tuple[str, bool | None], ...] = (
+        ("<|channel>thought\n", True),
+        ("<|channel>analysis\n", True),
+        ("<|channel>final\n", False),
+        ("<|channel>commentary\n", False),
+        ("<think>", True),
+        ("</think>", False),
+        ("<channel|>", None),
+    )
 
     def __init__(self, *, initial_reasoning: bool) -> None:
         self._in_reasoning = initial_reasoning
@@ -429,15 +439,22 @@ class ThinkingStreamParser:
         self._buffer += text
         emitted: list[tuple[str, str]] = []
         while self._buffer:
-            marker = "</think>" if self._in_reasoning else "<think>"
-            index = self._buffer.find(marker)
-            if index >= 0:
+            matches = [
+                (self._buffer.find(marker), marker, reasoning)
+                for marker, reasoning in self._MARKERS
+                if self._buffer.find(marker) >= 0
+            ]
+            if matches:
+                index, marker, reasoning = min(matches, key=lambda match: match[0])
                 if index:
                     emitted.append((self._field, self._buffer[:index]))
                 self._buffer = self._buffer[index + len(marker) :]
-                self._in_reasoning = not self._in_reasoning
+                if reasoning is not None:
+                    self._in_reasoning = reasoning
                 continue
-            retained = _longest_marker_prefix(self._buffer, marker)
+            retained = _longest_marker_prefixes(
+                self._buffer, tuple(marker for marker, _ in self._MARKERS)
+            )
             if retained:
                 prefix = self._buffer[: -len(retained)]
                 if prefix:
@@ -462,10 +479,12 @@ class ThinkingStreamParser:
 
 
 class ToolCallStreamParser:
-    """Withhold Qwen XML tool calls until they can become valid OpenAI deltas."""
+    """Withhold Qwen XML and Gemma native calls until OpenAI deltas are valid."""
 
-    _START = "<tool_call>"
-    _END = "</tool_call>"
+    _BOUNDARIES = (
+        ("<tool_call>", "</tool_call>"),
+        ("<|tool_call>", "<tool_call|>"),
+    )
 
     def __init__(self, allowed_names: set[str]) -> None:
         self._allowed_names = allowed_names
@@ -475,21 +494,28 @@ class ToolCallStreamParser:
         self._buffer += text
         emitted: list[tuple[str, Any]] = []
         while self._buffer:
-            start = self._buffer.find(self._START)
-            if start < 0:
-                retained = _longest_marker_prefix(self._buffer, self._START)
+            starts = [
+                (self._buffer.find(start), start, end)
+                for start, end in self._BOUNDARIES
+                if self._buffer.find(start) >= 0
+            ]
+            if not starts:
+                retained = _longest_marker_prefixes(
+                    self._buffer, tuple(start for start, _ in self._BOUNDARIES)
+                )
                 content = self._buffer[: -len(retained)] if retained else self._buffer
                 if content:
                     emitted.append(("content", content))
                 self._buffer = retained
                 break
-            if start:
-                emitted.append(("content", self._buffer[:start]))
-                self._buffer = self._buffer[start:]
-            end = self._buffer.find(self._END, len(self._START))
+            start_index, start_marker, end_marker = min(starts, key=lambda match: match[0])
+            if start_index:
+                emitted.append(("content", self._buffer[:start_index]))
+                self._buffer = self._buffer[start_index:]
+            end = self._buffer.find(end_marker, len(start_marker))
             if end < 0:
                 break
-            block_end = end + len(self._END)
+            block_end = end + len(end_marker)
             block = self._buffer[:block_end]
             _, calls = parse_tool_calls(block, self._allowed_names)
             emitted.append(("tool_calls", calls))
@@ -511,12 +537,18 @@ class ToolCallStreamParser:
 
 
 def parse_tool_calls(text: str, allowed_names: set[str]) -> tuple[str, list[dict[str, Any]]]:
-    """Translate Qwen XML or common JSON tool syntax into OpenAI tool calls."""
+    """Translate Qwen XML, Gemma native, or common JSON calls into OpenAI."""
 
     xml_matches = list(_TOOL_CALL_RE.finditer(text))
     if xml_matches:
         calls = [_xml_tool_call(match, allowed_names) for match in xml_matches]
         visible = _TOOL_CALL_RE.sub("", text).strip()
+        return visible, calls
+
+    gemma_matches = list(_GEMMA_TOOL_CALL_RE.finditer(text))
+    if gemma_matches:
+        calls = [_gemma_tool_call(match, allowed_names) for match in gemma_matches]
+        visible = _GEMMA_TOOL_CALL_RE.sub("", text).strip()
         return visible, calls
 
     stripped = text.strip()
@@ -826,6 +858,73 @@ def _json_tool_call(raw_call: Any, allowed_names: set[str]) -> dict[str, Any]:
     return _new_tool_call(function["name"], arguments, allowed_names, raw_call.get("id"))
 
 
+def _gemma_tool_call(match: re.Match[str], allowed_names: set[str]) -> dict[str, Any]:
+    """Parse Gemma's ``call:name{bare_key:<|\"|>value<|\"|>}`` wire syntax."""
+
+    raw_arguments = match.group("arguments").replace('<|"|>', '"')
+    json_arguments = _quote_gemma_object_keys(raw_arguments)
+    try:
+        arguments = json.loads("{" + json_arguments + "}")
+    except json.JSONDecodeError as error:
+        raise ApiRequestError(
+            "model returned invalid Gemma tool-call arguments", code="invalid_tool_call"
+        ) from error
+    if not isinstance(arguments, dict):  # pragma: no cover - wrapped object guarantees this
+        raise ApiRequestError(
+            "model tool-call arguments must be an object", code="invalid_tool_call"
+        )
+    return _new_tool_call(match.group("name"), arguments, allowed_names)
+
+
+def _quote_gemma_object_keys(value: str) -> str:
+    """Quote Gemma's bare object keys without touching quoted string values."""
+
+    output: list[str] = []
+    contexts: list[dict[str, bool]] = [{"object": True, "expect_key": True}]
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(value):
+        character = value[index]
+        if in_string:
+            output.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            index += 1
+            continue
+        if character == '"':
+            in_string = True
+            output.append(character)
+            index += 1
+            continue
+        context = contexts[-1]
+        if context["object"] and context["expect_key"]:
+            match = _GEMMA_BARE_KEY_RE.match(value, index)
+            if match is not None:
+                key = match.group("key")
+                output.append(json.dumps(key))
+                index = match.end("key")
+                context["expect_key"] = False
+                continue
+        output.append(character)
+        if character == "{":
+            contexts.append({"object": True, "expect_key": True})
+        elif character == "[":
+            contexts.append({"object": False, "expect_key": False})
+        elif character in "}]" and len(contexts) > 1:
+            contexts.pop()
+        elif character == "," and contexts[-1]["object"]:
+            contexts[-1]["expect_key"] = True
+        elif character == ":" and contexts[-1]["object"]:
+            contexts[-1]["expect_key"] = False
+        index += 1
+    return "".join(output)
+
+
 def _new_tool_call(
     name: str, arguments: dict[str, Any], allowed_names: set[str], call_id: Any = None
 ) -> dict[str, Any]:
@@ -862,6 +961,10 @@ def _longest_marker_prefix(text: str, marker: str) -> str:
     return ""
 
 
+def _longest_marker_prefixes(text: str, markers: tuple[str, ...]) -> str:
+    return max((_longest_marker_prefix(text, marker) for marker in markers), key=len, default="")
+
+
 def _longest_stop_prefix(text: str, stops: tuple[str, ...]) -> str:
     candidates = [_longest_marker_prefix(text, stop) for stop in stops]
     return max(candidates, key=len, default="")
@@ -872,6 +975,11 @@ _TOOL_CALL_RE = re.compile(
     r"(?P<body>.*?)</function>\s*</tool_call>",
     re.DOTALL,
 )
+_GEMMA_TOOL_CALL_RE = re.compile(
+    r"<\|tool_call>call:(?P<name>[A-Za-z0-9_-]+)\{(?P<arguments>.*?)\}<tool_call\|>",
+    re.DOTALL,
+)
+_GEMMA_BARE_KEY_RE = re.compile(r"\s*(?P<key>[A-Za-z_][A-Za-z0-9_-]*)\s*(?=:)")
 _PARAMETER_RE = re.compile(
     r"<parameter=(?P<name>[A-Za-z0-9_-]+)>\s*(?P<value>.*?)</parameter>", re.DOTALL
 )
