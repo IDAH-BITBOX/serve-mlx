@@ -1,0 +1,55 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Local operating-system and editor state.
+.DS_Store
+.idea/
+.vscode/
+
+# Credentials and Hugging Face authentication state. Never commit tokens,
+# private endpoints, or local environment overrides to a public repository.
+.env
+.env.*
+!.env.example
+.huggingface/
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+secrets/
+
+# Downloaded model artifacts. Source code must refer to a Hugging Face repo ID
+# or a user-supplied local path; it must never vendor multi-GB model weights.
+models/
+checkpoints/
+weights/
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Machine-specific prepared manifests include absolute local shard paths.
+# Recreate them with `mlx-moe-stream prepare` after cloning.
+prepared-*/
+manifest.local.json
+
+# Runtime/benchmark artifacts can expose prompts, routing, local hardware, or
+# memory-state data and are reproducible from the public commands.
+*.jsonl
+routes-summary.json
+*-predictor.json
+/m[0-9]*-*.json
+/m[0-9]*-*.txt
+benchmark-results/
+artifacts/
+coverage.xml
+htmlcov/
