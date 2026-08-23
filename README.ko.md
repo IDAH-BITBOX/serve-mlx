@@ -44,7 +44,22 @@ MoE 전문가 가중치가 머뭅니다.
 
 ## 설치
 
-저장소를 clone한 뒤 가상환경에 설치합니다.
+PyPI 정식 배포 전까지는 공개 GitHub `main`에서 바로 설치합니다. 일반 사용자는
+아래 명령을 사용하세요.
+
+```bash
+python3 -m pip install --upgrade \
+  "mlx-moe-stream[vlm] @ git+https://github.com/IDAH-BITBOX/serve-mlx.git@main"
+```
+
+`[vlm]`은 이미지 채팅 지원을 설치합니다. 텍스트 전용이면 이를 생략할 수 있습니다.
+
+```bash
+python3 -m pip install --upgrade \
+  "mlx-moe-stream @ git+https://github.com/IDAH-BITBOX/serve-mlx.git@main"
+```
+
+로컬에서 개발하려면 저장소를 clone한 뒤 가상환경에 설치합니다.
 
 ```bash
 git clone https://github.com/IDAH-BITBOX/serve-mlx.git
@@ -55,7 +70,7 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-이미지 입력도 사용할 경우에는 VLM 의존성을 함께 설치합니다.
+로컬 checkout에서 이미지 입력도 사용할 경우에는 VLM 의존성을 함께 설치합니다.
 
 ```bash
 python -m pip install -e ".[vlm]"

@@ -4,12 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mlx-moe-stream"
-version = "0.1.0a0"
+version = "0.1.0a1"
 description = "Exact out-of-core MoE routing analysis and serving for MLX"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "mlx-moe-stream contributors" }]
+urls = { Repository = "https://github.com/IDAH-BITBOX/serve-mlx", Issues = "https://github.com/IDAH-BITBOX/serve-mlx/issues" }
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
   "License :: OSI Approved :: Apache Software License",

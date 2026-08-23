@@ -45,7 +45,23 @@ Memory. Start with the automatic settings and watch `/metrics`.
 
 ## Install
 
-Clone this repository, then install it into a virtual environment:
+Until the project is published to PyPI, install the current public release
+directly from GitHub. This is the recommended command for users:
+
+```bash
+python3 -m pip install --upgrade \
+  "mlx-moe-stream[vlm] @ git+https://github.com/IDAH-BITBOX/serve-mlx.git@main"
+```
+
+`[vlm]` installs image-chat support. Omit it for text-only serving:
+
+```bash
+python3 -m pip install --upgrade \
+  "mlx-moe-stream @ git+https://github.com/IDAH-BITBOX/serve-mlx.git@main"
+```
+
+To develop from a local checkout, clone the repository and install it in a
+virtual environment instead:
 
 ```bash
 git clone https://github.com/IDAH-BITBOX/serve-mlx.git
@@ -56,7 +72,8 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-For image input, install the optional VLM dependency as well:
+For image input in a local checkout, install the optional VLM dependency as
+well:
 
 ```bash
 python -m pip install -e ".[vlm]"
