@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from mlx_moe_stream import cli
-from mlx_moe_stream.cli import main
+from mlx_moe_stream.cli import build_parser, main
 from mlx_moe_stream.routing import RouteEvent, RouteTracer
 
 
@@ -23,6 +23,36 @@ def test_simulate_command_reads_a_trace_and_writes_summary(tmp_path: Path, capsy
 def test_serve_requires_a_manifest():
     with pytest.raises(SystemExit, match="2"):
         main(["serve"])
+
+
+def test_kv_cache_options_parse_for_generate_and_serve():
+    parser = build_parser()
+
+    generate = parser.parse_args(
+        [
+            "generate",
+            "--manifest",
+            "prepared/manifest.json",
+            "--prompt",
+            "hello",
+            "--kv-cache",
+            "8bit",
+            "--kv-max-context",
+            "8192",
+        ]
+    )
+    serve = parser.parse_args(
+        [
+            "serve",
+            "--manifest",
+            "prepared/manifest.json",
+            "--kv-cache",
+            "4bit",
+        ]
+    )
+
+    assert (generate.kv_cache, generate.kv_max_context) == ("8bit", 8192)
+    assert serve.kv_cache == "4bit"
 
 
 def test_serve_rejects_non_loopback_hosts_before_loading_a_model(tmp_path: Path):
@@ -45,17 +75,20 @@ def test_serve_registers_multiple_models_without_loading_them(
 
     monkeypatch.setattr(cli, "run_local_server", stop_immediately)
     monkeypatch.setattr(cli, "LocalApiServer", FakeServer)
-    assert main(
-        [
-            "serve",
-            "--model",
-            f"qwen={tmp_path / 'qwen.json'}",
-            "--model",
-            f"gemma={tmp_path / 'gemma.json'}",
-            "--model-id",
-            "gemma",
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                "serve",
+                "--model",
+                f"qwen={tmp_path / 'qwen.json'}",
+                "--model",
+                f"gemma={tmp_path / 'gemma.json'}",
+                "--model-id",
+                "gemma",
+            ]
+        )
+        == 0
+    )
     assert seen[0].models()["data"][1]["id"] == "gemma"
     assert seen[0].registry.snapshot()["loads_total"] == 0
 

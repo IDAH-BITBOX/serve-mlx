@@ -7,8 +7,9 @@ from typing import Any
 
 import mlx.nn as nn
 
+from ..kv_cache import KvCacheConfig, make_memory_manager
 from ..manifest import ModelManifest, load_manifest
-from ..memory import MemoryBudgetConfig, MemoryBudgetManager
+from ..memory import MemoryBudgetConfig
 from ..prefetch import PredictivePrefetchConfig, TransitionPredictor
 from ..runtime import PREFILL_ORDERS, CachedExpertRuntime, NoCacheExpertRuntime, PrefillOrder
 from ..storage import load_nonexpert_weights
@@ -37,6 +38,7 @@ class Qwen35MoeAdapter:
         resident_budget_bytes: int | None = None,
         auto_resident_budget: bool = False,
         memory_config: MemoryBudgetConfig | None = None,
+        kv_cache_config: KvCacheConfig | None = None,
         predictor: TransitionPredictor | None = None,
         predictive_config: PredictivePrefetchConfig | None = None,
         prefill_strategy: str = "expert_major",
@@ -60,6 +62,7 @@ class Qwen35MoeAdapter:
                 resident_budget_bytes=resident_budget_bytes,
                 auto_resident_budget=auto_resident_budget,
                 memory_config=memory_config,
+                kv_cache_config=kv_cache_config,
                 predictor=predictor,
                 predictive_config=predictive_config,
                 prefill_strategy=prefill_strategy,
@@ -92,9 +95,15 @@ class Qwen35MoeAdapter:
             model.eval()
             mx.eval(model.parameters())
 
-            memory_manager = MemoryBudgetManager(memory_config)
+            shell_bytes = int(mx.get_active_memory())
+            memory_manager, kv_cache = make_memory_manager(
+                memory_config,
+                kv_cache_config,
+                model_config=config,
+                shell_bytes=shell_bytes,
+            )
             memory_budget = memory_manager.plan(
-                shell_bytes=int(mx.get_active_memory()),
+                shell_bytes=shell_bytes,
                 requested_expert_budget_bytes=resident_budget_bytes,
                 auto_enabled=auto_resident_budget,
                 minimum_expert_bytes=max(
@@ -138,6 +147,7 @@ class Qwen35MoeAdapter:
             runtime=runtime,
             memory_manager=memory_manager,
             memory_budget=memory_budget,
+            kv_cache=kv_cache,
         )
 
     def replace_moe_blocks(

@@ -298,6 +298,27 @@ def test_m12_text_completion_uses_vlm_preparation(service: LocalGenerationServic
     assert "input_ids" not in captured["kwargs"]
 
 
+def test_kv_cache_generation_kwargs_are_forwarded_to_mlx(service, monkeypatch):
+    assert service._legacy_engine is not None
+    service._legacy_engine.kv_cache = SimpleNamespace(
+        generation_kwargs=lambda: {"kv_bits": 4, "kv_group_size": 64},
+        to_dict=lambda: {"effective_mode": "4bit"},
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_stream_generate(*_: Any, **kwargs: Any):
+        captured.update(kwargs)
+        yield _Response("ok", 1, 1)
+
+    monkeypatch.setattr("mlx_moe_stream.server.app.stream_generate", fake_stream_generate)
+    response = service.completions({"model": "test-moe", "prompt": "hello"})
+
+    assert response["choices"][0]["text"] == "ok"
+    assert captured["kv_bits"] == 4
+    assert captured["kv_group_size"] == 64
+    assert service.metrics_snapshot()["kv_cache"] == {"effective_mode": "4bit"}
+
+
 def test_m11_thinking_and_qwen_tool_calls(
     service: LocalGenerationService, monkeypatch: pytest.MonkeyPatch
 ):

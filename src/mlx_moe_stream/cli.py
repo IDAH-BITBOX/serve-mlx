@@ -10,6 +10,7 @@ from pathlib import Path
 from .cache import MemoryBudgetError
 from .config import parse_bytes, parse_resident_budget
 from .errors import MlxMoeStreamError
+from .kv_cache import KvCacheConfig
 from .logging import configure_logging
 from .memory import MemoryBudgetConfig
 from .models import load_streaming_model
@@ -32,9 +33,7 @@ from .storage import build_streaming_manifest
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="mlx-moe-stream", description="MLX out-of-core MoE tools"
-    )
+    parser = argparse.ArgumentParser(prog="mlx-moe-stream", description="MLX out-of-core MoE tools")
     parser.add_argument("--verbose", action="store_true", help="emit diagnostic logs")
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -106,8 +105,9 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument(
         "--kv-reserve",
         default="1GB",
-        help="M7 reserve for mlx-lm KV cache growth (default: 1GB)",
+        help="minimum M7 reservation for KV cache growth (default: 1GB)",
     )
+    _add_kv_cache_options(generate, include_max_context=True)
     generate.add_argument(
         "--scratch-reserve",
         default="1GB",
@@ -185,7 +185,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="M4/M7 expert-cache capacity (default: auto)",
     )
     serve.add_argument("--memory-safety-margin", default="2GB")
-    serve.add_argument("--kv-reserve", default="1GB")
+    serve.add_argument(
+        "--kv-reserve",
+        default="1GB",
+        help="minimum M7 reservation for KV cache growth (default: 1GB)",
+    )
+    _add_kv_cache_options(serve, include_max_context=False)
     serve.add_argument("--scratch-reserve", default="1GB")
     serve.add_argument("--wired-limit")
     serve.add_argument(
@@ -295,11 +300,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 wired_limit_bytes=(parse_bytes(args.wired_limit) if args.wired_limit else None),
             )
             predictor, predictive_config = _predictive_options(args)
+            kv_cache_config = KvCacheConfig(
+                mode=args.kv_cache,
+                max_context_tokens=args.kv_max_context,
+            )
             engine = load_streaming_model(
                 args.manifest,
                 resident_budget_bytes=resident_budget,
                 auto_resident_budget=auto_resident_budget,
                 memory_config=memory_config,
+                kv_cache_config=kv_cache_config,
                 prefill_strategy=args.prefill_strategy,
                 prefill_order=args.prefill_order,
                 io_workers=args.io_workers,
@@ -338,12 +348,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     json.dumps(
                         {
                             "budget": engine.memory_budget.to_dict(),
+                            "kv_cache": (
+                                engine.kv_cache.to_dict() if engine.kv_cache is not None else None
+                            ),
                             "final_snapshot": (
                                 final_snapshot.to_dict() if final_snapshot is not None else None
                             ),
-                            "pressure_events": [
-                                event.to_dict() for event in stats.memory_events
-                            ],
+                            "pressure_events": [event.to_dict() for event in stats.memory_events],
                         },
                         indent=2,
                         sort_keys=True,
@@ -361,6 +372,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 budget.available_expert_bytes,
                 budget.expert_budget_bytes,
             )
+            if engine.kv_cache is not None:
+                logger.info(
+                    "KV cache: requested=%s effective=%s context=%s estimate=%s reserve=%s",
+                    engine.kv_cache.requested_mode,
+                    engine.kv_cache.effective_mode,
+                    engine.kv_cache.max_context_tokens,
+                    engine.kv_cache.estimated_bytes,
+                    engine.kv_cache.reserve_bytes,
+                )
             if stats.memory_events:
                 logger.warning(
                     "M7 pressure actions: %s",
@@ -433,6 +453,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 wired_limit_bytes=(parse_bytes(args.wired_limit) if args.wired_limit else None),
             )
             predictor, predictive_config = _predictive_options(args)
+            kv_cache_config = KvCacheConfig(
+                mode=args.kv_cache,
+                max_context_tokens=args.max_prompt_tokens + args.max_tokens,
+            )
             registrations = _serve_registrations(
                 args.manifest,
                 args.model,
@@ -454,6 +478,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     resident_budget_bytes=resident_budget,
                     auto_resident_budget=auto_resident_budget,
                     memory_config=memory_config,
+                    kv_cache_config=kv_cache_config,
                     prefill_strategy=args.prefill_strategy,
                     prefill_order=args.prefill_order,
                     io_workers=args.io_workers,
@@ -507,6 +532,22 @@ def _serve_registrations(
     if not model_specs:
         raise ValueError("serve requires --manifest or at least one --model MODEL_ID=MANIFEST")
     return tuple(ModelRegistration.parse(value) for value in model_specs)
+
+
+def _add_kv_cache_options(parser: argparse.ArgumentParser, *, include_max_context: bool) -> None:
+    parser.add_argument(
+        "--kv-cache",
+        choices=("auto", "bf16", "8bit", "4bit"),
+        default="auto",
+        help="KV cache precision: auto, bf16, 8bit, or 4bit (default: auto)",
+    )
+    if include_max_context:
+        parser.add_argument(
+            "--kv-max-context",
+            type=int,
+            default=4_096,
+            help="largest context to reserve KV cache for (default: 4096)",
+        )
 
 
 def _add_predictive_prefetch_options(parser: argparse.ArgumentParser) -> None:

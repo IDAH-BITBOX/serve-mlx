@@ -1,497 +1,344 @@
 # mlx-moe-stream
 
-`mlx-moe-stream` is an Apple-Silicon-first project for exact out-of-core MoE
-inference on top of [mlx-lm](https://github.com/ml-explore/mlx-lm). It keeps
-non-expert weights on the normal mlx-lm path and will stream only routed expert
-weights into an explicitly budgeted resident working set.
+**Run large MLX Mixture-of-Experts (MoE) models locally on an Apple-silicon
+Mac, with routed expert weights streamed from SSD instead of keeping every
+expert in Unified Memory.**
 
-The repository is at the M12 image-VLM protocol milestone. It can trace
-Qwen3-MoE routing, create a validated manifest for exact expert-only disk
-reads, execute the exact streaming MoE path, retain routed experts in an
-explicit byte-budgeted LRU cache, and materialize each routed prefill expert
-once per layer. It also overlaps known exact expert reads with MLX GPU work.
-M7 measures the real quantized non-expert shell, derives a safe expert-cache
-budget from MLX's recommended working set, and records memory pressure actions.
-M8 exposes one loaded engine through a bounded localhost OpenAI-compatible API.
-M8.5 dispatches a prepared checkpoint to an exact Qwen3, Qwen3.5, or Gemma 4
-text adapter. M9 registers multiple prepared manifests but holds at most one
-engine in Unified Memory. M10 adds strictly bounded, trace-trained next-layer
-expert prefetch. M11 adds SSE streaming, sampling controls, Qwen
-thinking/tool-call protocol translation, and validated structured JSON
-responses. M12 adds image chat for Qwen3.6 and Gemma 4 through `mlx-vlm` while
-keeping every routed text-MoE expert in the same SSD-backed runtime. Vision
-tower, projector, router, shared expert, and dense text weights remain in
-Unified Memory; only the selected routed experts are materialized from SSD.
+`mlx-moe-stream` is a local, OpenAI-compatible server for supported MLX MoE
+checkpoints. It preserves the model's router and expert computation: only the
+experts selected for the current layer are read and materialized. The model's
+non-expert shell (router, attention, shared/dense weights, and—in vision
+mode—the vision tower) remains in Unified Memory.
+
+한국어 사용 가이드: [README.ko.md](README.ko.md)
+
+> This is pre-release software. It is designed for local, single-user serving
+> on `127.0.0.1`, and it runs one generation at a time to keep memory use
+> predictable.
+
+## What you can do
+
+| Need | Supported interface |
+| --- | --- |
+| Text completion and chat | `/v1/completions`, `/v1/chat/completions` |
+| Token streaming | OpenAI-style SSE (`stream: true`) |
+| Reasoning / thinking output | `reasoning_content` in chat responses when the model emits it |
+| Function calling | OpenAI-style `tools` and `tool_choice`, for compatible tokenizer templates |
+| Structured output | `response_format: json_object` or `json_schema` (non-streaming) |
+| Image chat | Qwen3.6 and Gemma 4 with `--vision` and the optional VLM install |
+| Several local models | Repeat `--model MODEL_ID=MANIFEST`; one model is resident at a time |
 
 ## Requirements
 
-- Apple Silicon and macOS
-- Python 3.10+
-- A supported MLX safetensors MoE checkpoint, locally available or from a
-  Hugging Face repository
+- Apple Silicon Mac and macOS
+- Python 3.10 or newer
+- Disk space for the MLX checkpoint and SSD reads during inference
+- A supported MLX safetensors MoE checkpoint. The tested examples are:
+  - `mlx-community/Qwen3-30B-A3B-4bit`
+  - `mlx-community/Qwen3.6-35B-A3B-8bit`
+  - `mlx-community/gemma-4-26b-a4b-it-8bit`
+
+Large models can reside on SSD, but they are not zero-memory models: the
+non-expert shell, the active routed experts, and the KV cache still use Unified
+Memory. Start with the automatic settings and watch `/metrics`.
 
 ## Install
 
+Clone this repository, then install it into a virtual environment:
+
 ```bash
-python3.12 -m pip install -e ".[dev]"
+git clone https://github.com/IDAH-BITBOX/serve-mlx.git
+cd serve-mlx
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+For image input, install the optional VLM dependency as well:
+
+```bash
+python -m pip install -e ".[vlm]"
+```
+
+Verify the command is available:
+
+```bash
 mlx-moe-stream --help
-pytest
 ```
 
-Install the optional image-VLM processor dependency before using `serve
---vision`:
+## Quick start: text model
 
-```bash
-python3.12 -m pip install -e ".[dev,vlm]"
-```
+### 1. Prepare a manifest
 
-## Capture a routing trace
-
-The tracer uses the normal mlx-lm execution path. It only observes router
-top-k indices and scores, so enabling it does not change model routing or
-expert execution.
-
-```bash
-mlx-moe-stream trace \
-  --model mlx-community/Qwen3-30B-A3B-4bit \
-  --prompt "Explain sparse mixture-of-experts routing." \
-  --max-tokens 64 \
-  --output routes.jsonl \
-  --summary routes-summary.json
-```
-
-`routes.jsonl` has one event per routed token and MoE layer. Each event records
-the request ID, prefill/decode phase, token and layer IDs, selected experts,
-router scores, and a UTC timestamp.
-
-The trace command uses greedy decoding and has an initial batch-size-one scope.
-No remote Python model code is executed (`trust_remote_code=False`).
-
-## Simulate cache locality
-
-```bash
-mlx-moe-stream simulate --trace routes.jsonl
-```
-
-The M1 simulator assumes equal-sized expert bundles. M2's manifest now records
-the exact byte size of every expert bundle; byte-weighted cache simulation will
-replace the baseline in M4.
-
-## Prepare exact expert reads (M2 / M8.5)
+The manifest indexes the exact safetensors byte ranges for each expert. It does
+not copy model weights. Run it once for each model checkpoint:
 
 ```bash
 mlx-moe-stream prepare \
   --model mlx-community/Qwen3-30B-A3B-4bit \
   --output prepared-qwen3
-
-python benchmarks/storage_read.py \
-  --manifest prepared-qwen3/manifest.json \
-  --layer 0 --expert 0
 ```
 
-`prepare` reads only safetensors headers and creates `manifest.json`; it does
-not duplicate model shards or materialize weights in MLX. The storage benchmark
-uses `os.pread()` for only the requested expert's tensor ranges and reports
-the exact read bytes and count.
+This creates `prepared-qwen3/manifest.json`. Keep the manifest next to the
+checkpoint cache or in your project; it is small and is safe to recreate with
+the same checkpoint.
 
-M8.5 recognizes these layouts automatically:
-
-- `qwen3_moe` — Qwen3-MoE
-- `qwen3_5_moe` — Qwen3.5-MoE text subtree, including its resident shared expert
-- `gemma4` — Gemma 4 26B-A4B text subtree, using GeGLU routed experts
+### 2. Start the local server
 
 ```bash
-mlx-moe-stream prepare \
-  --model mlx-community/Qwen3.6-35B-A3B-8bit \
-  --output prepared-qwen3.6-35b
-
-mlx-moe-stream prepare \
-  --model mlx-community/gemma-4-26b-a4b-it-8bit \
-  --output prepared-gemma4-26b
-```
-
-Without `--vision`, these multimodal checkpoints use their text-only
-`language_model` path. M12 exposes image chat through `serve --vision`; the
-`generate` CLI remains text-only. Image VLM keeps the vision tower in Unified
-Memory and continues to stream only the routed text experts from the prepared
-manifest.
-
-## Exact generation: M3–M5
-
-```bash
-mlx-moe-stream generate \
-  --manifest prepared-qwen3/manifest.json \
-  --prompt "Explain sparse MoE routing." \
-  --max-tokens 16
-```
-
-Without `--resident-budget`, M3 keeps all routed experts on SSD and
-materializes every selected expert for the active forward pass. This remains
-the exact no-cache correctness baseline.
-
-Set an explicit M4 cache budget to retain only selected expert arrays in the
-Unified Memory working set. A hit never reads the SSD; a miss reads the same
-exact manifest spans as M3. The cache never changes router choices or expert
-math.
-
-```bash
-mlx-moe-stream generate \
-  --manifest prepared-qwen3/manifest.json \
-  --resident-budget 2GB \
-  --prompt "Explain sparse MoE routing." \
-  --max-tokens 16
-```
-
-The budget is an expert-only cache limit. M7 validates explicit values against
-the measured shell plus the configured KV, scratch, and OS safety reservations.
-M4 still fails explicitly if even one required expert cannot fit or if every
-evictable entry is pinned; it never silently falls back to approximate
-inference.
-
-## Expert-major prefill (M5)
-
-For every prefill layer, M5 first collects all router choices, groups selected
-tokens by expert, materializes that expert once, and restores outputs to their
-original `(token, top-k)` slots. Decode remains token-major. `expert_major` is
-the default whenever a model call has more than one input token; use
-`token_major` as the exact M3/M4 prefill baseline.
-
-```bash
-mlx-moe-stream generate \
-  --manifest prepared-qwen3/manifest.json \
-  --resident-budget 2GB \
-  --prefill-strategy expert_major \
-  --prefill-order resident_first \
-  --prompt "Explain sparse MoE routing." \
-  --max-tokens 16
-```
-
-The order can be `resident_first`, `expert_id`, or `disk_offset`. It affects
-only load order, never router choices or output placement. MLX batched
-quantized matmul does not exactly match repeated vector matmul for this model,
-so M5 shares each expert's I/O/materialization but retains vector math per
-selected token to preserve exact logits.
-
-Measure the prefill baseline and M5 side-by-side. `--repeat` creates a longer
-tokenized prompt while reporting its actual token count.
-
-```bash
-python benchmarks/prefill.py \
-  --manifest prepared-qwen3/manifest.json \
-  --prompt "Explain sparse MoE routing." \
-  --repeat 32 \
-  --resident-budget 2GB \
-  --prefill-strategy expert_major \
-  --prefill-order resident_first
-```
-
-## I/O and GPU overlap (M6)
-
-M6 has a bounded priority I/O worker pool. Once the router has exposed an
-exact current-layer expert set, it reads the next known expert in the
-background while MLX executes the current expert. Duplicate demand/prefetch
-requests coalesce to one `pread()` task. This is not predictive prefetch: a
-miss still waits for and executes its actual routed expert, so output semantics
-are unchanged.
-
-M6 is explicit by default (`--io-workers 0` keeps the M5 sequential path):
-
-```bash
-mlx-moe-stream generate \
-  --manifest prepared-qwen3/manifest.json \
-  --resident-budget 2GB \
-  --io-workers 1 \
-  --prefetch-depth 1 \
-  --async-gpu \
-  --timeline m6-timeline.json \
-  --prompt "Explain sparse MoE routing." \
-  --max-tokens 16
-```
-
-The timeline records `load_start`, `load_end`, `materialize_start`,
-`materialize_end`, `gpu_enqueue`, and `gpu_done`. Compare M6's three required
-paths on the same workload:
-
-```bash
-python benchmarks/overlap.py \
-  --manifest prepared-qwen3/manifest.json \
-  --prompt "Explain sparse MoE routing." \
-  --io-workers 1 \
-  --prefetch-depth 1
-```
-
-## Safe automatic Unified Memory budget (M7)
-
-Use `--resident-budget auto` to measure the quantized non-expert shell after it
-is loaded, then reserve capacity for the OS, the mlx-lm KV cache, and transient
-MLX work before setting the expert-only LRU capacity:
-
-```bash
-mlx-moe-stream generate \
-  --manifest prepared-qwen3/manifest.json \
-  --resident-budget auto \
-  --memory-safety-margin 2GB \
-  --kv-reserve 1GB \
-  --scratch-reserve 1GB \
-  --memory-summary m7-memory.json \
-  --prompt "Explain sparse MoE routing." \
-  --max-tokens 16
-```
-
-The automatic cache budget is:
-
-```text
-max_recommended_working_set
-− safety_margin
-− measured_nonexpert_shell
-− KV_reserve
-− scratch_reserve
-```
-
-`m7-memory.json` records the startup decision, MLX active/cache/peak memory,
-process RSS, and macOS swap state before and after the request. Swap is only an
-observability signal; it is never treated as cache capacity or a success path.
-At a completed sparse-layer safe point, sustained working-set pressure first
-turns off future prefetches, then evicts unpinned LRU experts, shrinks the
-expert cache, and finally rejects the request with an explicit error. Router
-choices and expert math are unchanged by all four actions.
-
-`--wired-limit` calls `mx.set_wired_limit()` only when explicitly supplied. No
-default mode changes macOS `sysctl` settings or requires administrator access.
-
-## Local OpenAI-compatible server (M8–M12)
-
-M8 loads one prepared supported-MoE manifest once, enables the M7 automatic budget
-by default, and serializes model execution to one active generation. It binds
-only to `127.0.0.1` or `localhost`; unauthenticated non-loopback binds are
-rejected deliberately.
-
-```bash
-mlx-moe-stream --verbose serve \
+mlx-moe-stream serve \
   --manifest prepared-qwen3/manifest.json \
   --model-id qwen3-local \
-  --port 8000 \
-  --max-prompt-tokens 4096 \
-  --max-tokens 256
+  --resident-budget auto \
+  --kv-cache auto
 ```
 
-For an image-capable Qwen3.6 or Gemma 4 checkpoint, enable its vision tower
-explicitly. This adds the dense vision shell to the measured M7 budget; it
-does not load the MoE expert bank.
+The server listens on `http://127.0.0.1:8000`. The first request loads the
+model shell and can take noticeably longer than later requests.
+
+### 3. Send a chat request
 
 ```bash
-mlx-moe-stream --verbose serve \
-  --manifest prepared-gemma4-26b/manifest.json \
-  --model-id gemma4-vision \
-  --vision \
-  --port 8000
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3-local",
+    "messages": [{"role": "user", "content": "Explain sparse MoE routing in two sentences."}],
+    "max_tokens": 128,
+    "temperature": 0.2
+  }'
 ```
 
-The API has these endpoints:
+Check health, registered models, and memory/KV decisions:
 
-- `GET /health`
-- `GET /v1/models`
-- `POST /v1/completions`
-- `POST /v1/chat/completions`
-- `GET /metrics`
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/v1/models
+curl http://127.0.0.1:8000/metrics
+```
 
-`/metrics` returns JSON aggregate counts plus the last request's TTFT,
-prefill/decode tok/s, cache hit rate, disk bytes, resident expert bytes, and
-MLX peak memory. A second simultaneous generation receives HTTP `429` rather
-than sharing mutable KV or expert-cache state.
+## Use it from the OpenAI Python SDK
 
-M12 supports `n=1` requests with this local OpenAI-compatible subset:
-
-- `stream=true` sends `text/event-stream` chunks and ends with `data: [DONE]`.
-  `stream_options: {"include_usage": true}` emits a final usage-only chunk.
-- `temperature`, `top_p`, `seed`, `presence_penalty`, `frequency_penalty`,
-  `logit_bias`, and up to four `stop` sequences map to MLX sampler/logit
-  processors. Stop prefixes are withheld so they cannot leak into SSE output.
-- Qwen templates that declare `enable_thinking` expose `<think>` output as
-  `message.reasoning_content` (or `delta.reasoning_content` while streaming).
-  `reasoning_effort: "none"` requests the template's no-thinking form.
-- Function `tools` and `tool_choice` use a tokenizer's tool-aware chat
-  template. Qwen XML and Gemma native tool calls become OpenAI `tool_calls`;
-  the server never executes a tool. Send a `role: "tool"` result in the next
-  client request.
-- `response_format` supports `json_object` and `json_schema`, which are
-  prompted and then validated locally with Draft 2020-12 JSON Schema.
-  Structured responses use `stream=false` so invalid output is never committed
-  before validation.
-- Image chat accepts an OpenAI-style `content` part with
-  `{"type":"image_url","image_url":{"url":"..."}}`, or the compatible
-  `{"type":"input_image","image_url":"..."}` form. The image source may
-  be an `https://` URL, a local path, or a `data:image/...` URI. Up to four
-  images are accepted in `user` messages. Image input requires an engine
-  started with `--vision`.
-
-M12 intentionally supports images only. Audio and video content parts fail
-closed with HTTP 400 rather than being treated as text or silently ignored.
-
-The server rejects a tokenizer without a declared tool-aware template rather
-than silently pretending to support `tools`.
-
-Use it with the OpenAI Python client (the client is optional; it is not a
-server dependency):
+Point an OpenAI-compatible client to the local base URL. No API key is needed,
+but the SDK normally requires a non-empty placeholder value.
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="local-unused")
-reply = client.chat.completions.create(
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="local")
+
+response = client.chat.completions.create(
     model="qwen3-local",
-    messages=[{"role": "user", "content": "Explain sparse MoE routing."}],
-    max_tokens=64,
-)
-print(reply.choices[0].message.content)
-```
-
-Image chat uses the same OpenAI client API:
-
-```python
-reply = client.chat.completions.create(
-    model="gemma4-vision",
-    reasoning_effort="none",
-    messages=[
-        {
-            "role": "user",
-            "content": [
-                {"type": "input_image", "image_url": "/path/to/photo.png"},
-                {"type": "text", "text": "Describe the image."},
-            ],
-        }
-    ],
+    messages=[{"role": "user", "content": "Give me three uses of MoE models."}],
     max_tokens=128,
 )
+print(response.choices[0].message.content)
 ```
 
-When a final response has `finish_reason="tool_calls"`, execute the named
-function in your own application and append its output as a `role: "tool"`
-message. The local server intentionally has no authority to run arbitrary
-functions or shell commands.
+### Stream tokens
 
-M12 can expose one prepared Qwen3-MoE, Qwen3.5-MoE, or Gemma 4 manifest at a
-time. `--vision` is available for the supported Qwen3.5 and Gemma 4 VLM
-families; standard Qwen3-MoE remains text-only. This is not a universal loader
-for dense models or arbitrary MoE layouts. Adding a family still requires an
-adapter that proves selective expert reads and preserves its router/expert
-semantics.
-
-## Lazy model registry (M9)
-
-Use repeated `--model MODEL_ID=MANIFEST` to make multiple prepared models
-discoverable through `GET /v1/models`. The server starts with **no** loaded
-engine. The first request for a model loads its selected text or image-VLM shell
-and streams only its routed experts. A request for another model closes the prior engine before
-opening the next one, so Qwen and Gemma shells never coexist in Unified Memory.
-
-```bash
-mlx-moe-stream --verbose serve \
-  --model qwen3.6=prepared-qwen3.6-35b/manifest.json \
-  --model gemma4=prepared-gemma4-26b/manifest.json \
-  --model-id qwen3.6 \
-  --port 8000
+```python
+stream = client.chat.completions.create(
+    model="qwen3-local",
+    messages=[{"role": "user", "content": "Write a short haiku about SSDs."}],
+    max_tokens=128,
+    stream=True,
+    stream_options={"include_usage": True},
+)
+for event in stream:
+    text = event.choices[0].delta.content if event.choices else None
+    if text:
+        print(text, end="", flush=True)
 ```
 
-`--model-id` selects the default when a client omits `model`; each OpenAI
-request may select any registered model ID explicitly. The same single active
-generation limit applies during loading and inference. `/metrics` includes a
-`registry` object with the active ID plus load, unload, switch, and load-failure
-counters. The original single-model `--manifest ... --model-id ...` invocation
-remains supported.
+## Image chat (Qwen3.6 or Gemma 4)
 
-## Trace-trained predictive prefetch (M10)
-
-M10 trains a conditional distribution from route traces: after the current
-layer's router has selected experts, it may issue exact `pread()` requests for
-likely experts in the **next** layer. It never changes router IDs, expert
-weights, or output math. A wrong prediction is only a bounded unused I/O read.
-
-Train a predictor from a trace, then attach it to generation or serving:
+Prepare the model, install `[vlm]`, and start the server with `--vision`:
 
 ```bash
-mlx-moe-stream train-predictor \
-  --trace routes.jsonl \
-  --model-type qwen3_moe \
-  --output qwen3-predictor.json
+mlx-moe-stream prepare \
+  --model mlx-community/Qwen3.6-35B-A3B-8bit \
+  --output prepared-qwen3.6
 
+mlx-moe-stream serve \
+  --manifest prepared-qwen3.6/manifest.json \
+  --model-id qwen3.6-local \
+  --vision \
+  --kv-cache auto
+```
+
+Send an image URL, a `data:` URL, or a local file path in a user message. At
+most four images are accepted per request. Audio and video are intentionally
+not supported.
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.6-local",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "input_image", "image_url": "https://example.com/photo.jpg"},
+        {"type": "text", "text": "Describe this image briefly."}
+      ]
+    }],
+    "max_tokens": 128
+  }'
+```
+
+For Gemma 4, substitute this model ID when preparing:
+
+```text
+mlx-community/gemma-4-26b-a4b-it-8bit
+```
+
+## KV-cache precision and memory
+
+The KV cache grows with context length. Choose its precision with
+`--kv-cache` on both `serve` and `generate`:
+
+```bash
+--kv-cache auto   # default: choose the safest useful mode
+--kv-cache bf16   # native, unquantized MLX KV cache
+--kv-cache 8bit   # quantized KV cache; lower memory use
+--kv-cache 4bit   # most compact KV cache; use for oversized context/model pressure
+```
+
+`auto` decides only after the real non-expert model shell has been loaded and
+measured. Its policy is:
+
+1. Enough post-shell Unified Memory headroom: use native BF16/FP KV cache.
+2. BF16 does not fit the KV allowance: use 8-bit KV cache.
+3. 8-bit does not fit (for example, an oversized model or maximum context): use 4-bit KV cache.
+
+The resolved mode, estimated KV bytes, and reservation appear in server
+`/metrics` and in the `generate` log / optional memory summary. The automatic
+choice also reserves that estimate before allocating the expert cache, so
+`--resident-budget auto` has less memory available when a larger KV cache is
+needed.
+
+For the `generate` command, tell the planner the largest total context you
+expect (prompt plus completion):
+
+```bash
 mlx-moe-stream generate \
   --manifest prepared-qwen3/manifest.json \
-  --io-workers 1 \
-  --prefetch-depth 1 \
-  --async-gpu \
-  --predictor qwen3-predictor.json \
-  --predictive-prefetch-candidates 4 \
-  --predictive-min-confidence 0.25 \
-  --predictive-prefetch-budget 32MB \
-  --prompt "Explain sparse MoE routing." \
-  --max-tokens 16
+  --prompt "Summarize this document..." \
+  --max-tokens 512 \
+  --kv-cache auto \
+  --kv-max-context 8192 \
+  --resident-budget auto
 ```
 
-The predictor's model type, layer count, and expert count must exactly match
-the prepared manifest; a mismatch is rejected before inference. M10 also
-requires at least one M6 I/O worker. Each router call has independent hard
-limits for candidate count and speculative bytes, in addition to the existing
-bounded loader queue. CLI logs and server `/metrics` report submitted,
-used, and unused predictive reads separately from M6's known-route prefetch.
+For `serve`, the reservation is calculated from
+`--max-prompt-tokens + --max-tokens`; set those limits honestly. `--kv-reserve`
+is a minimum safety floor, not the requested cache precision.
 
-The included `trace` command currently captures Qwen3-MoE route traces. The
-predictor format is family-neutral, but Qwen3.5 and Gemma4 need a matching
-family route JSONL before M10 will enable for their manifests.
+Quantized KV cache reduces memory use but can change generation quality. Use
+`bf16` for quality-sensitive short contexts, and prefer `auto` or `8bit`/`4bit`
+when serving a large model on a smaller-memory Mac.
 
-## Forced-oversubscription decode benchmark (M4)
+## Multiple models
 
-Run the same prompt at a deliberately small fraction of all expert bytes. Each
-JSON result includes decode tok/s, p50/p95 latency, cache and byte hit rates,
-disk bytes/token, and evictions/token. Omit `--budget-fraction` for the M3
-no-cache baseline.
-
-`disk_bytes` is the exact logical byte range requested from the expert store.
-macOS may satisfy repeat `pread()` calls from its page cache, so use a controlled
-cold-cache environment before interpreting tok/s as physical-SSD throughput.
-M4 synchronizes at the sparse-layer boundary to release pin-safe MLX arrays;
-M6 is the milestone that removes this scheduling limitation with explicit I/O
-and GPU overlap.
+Register several prepared manifests with IDs. This exposes all of them through
+`/v1/models`, but keeps only the currently requested engine in Unified Memory.
+Switching models unloads the prior engine and loads the selected one.
 
 ```bash
-python benchmarks/decode.py \
+mlx-moe-stream serve \
+  --model qwen=prepared-qwen3.6/manifest.json \
+  --model gemma=prepared-gemma4/manifest.json \
+  --model-id qwen \
+  --vision \
+  --resident-budget auto \
+  --kv-cache auto
+```
+
+Use `"model": "qwen"` or `"model": "gemma"` in each API request. All
+registered models share the server's memory, context, KV-cache, and `--vision`
+settings; run separate server processes when models need different policies.
+
+## Thinking, tools, and JSON output
+
+For chat completions, the server passes tool definitions and thinking controls
+to tokenizer templates that declare support for them. It converts compatible
+model output into OpenAI-style `reasoning_content` and `tool_calls` fields.
+
+```python
+response = client.chat.completions.create(
+    model="qwen3-local",
+    messages=[{"role": "user", "content": "What is the weather in Seoul?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Look up current weather.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }],
+    tool_choice="auto",
+    reasoning_effort="medium",
+)
+print(response.choices[0].message.tool_calls)
+```
+
+`response_format` supports `json_object` and `json_schema` for non-streaming
+chat requests. JSON is validated before the response is returned; streaming
+structured output is deliberately rejected because it cannot be validated
+safely before the final token.
+
+## One-shot generation and routing tools
+
+Use `generate` for a direct text prompt without starting HTTP serving:
+
+```bash
+mlx-moe-stream generate \
   --manifest prepared-qwen3/manifest.json \
   --prompt "Explain sparse MoE routing." \
-  --max-tokens 16 \
-  --budget-fraction 0.1 \
-  --budget-fraction 0.2 \
-  --budget-fraction 0.3 \
-  --budget-fraction 0.5
+  --max-tokens 64 \
+  --resident-budget auto \
+  --kv-cache auto
 ```
 
-For an exact reference comparison while cache-enabled:
+Use `trace` to inspect Qwen3-MoE router choices and `simulate` to examine
+expert-cache locality:
 
 ```bash
-python benchmarks/correctness.py \
-  --manifest prepared-qwen3/manifest.json \
-  --prompt "Hi." \
-  --resident-budget 2GB
+mlx-moe-stream trace \
+  --model mlx-community/Qwen3-30B-A3B-4bit \
+  --prompt "Explain sparse MoE routing." \
+  --max-tokens 64 \
+  --output routes.jsonl \
+  --summary routes-summary.json
+
+mlx-moe-stream simulate --trace routes.jsonl
 ```
 
-You can run the same trace workflow directly:
+## Practical tuning order
+
+1. Start with `--resident-budget auto --kv-cache auto`.
+2. Keep `--max-prompt-tokens` and `--max-tokens` near real usage.
+3. If memory pressure or swapping appears, reduce context first, then select
+   `--kv-cache 8bit` or `--kv-cache 4bit`.
+4. If responses are slow but memory is healthy, increase SSD locality with a
+   reasonable resident expert budget; do not allocate beyond the reported
+   safe budget.
+5. Keep the server on loopback unless you add your own authenticated reverse
+   proxy. This server intentionally has no authentication.
+
+## Development
+
+Install test tools with `python -m pip install -e ".[dev,vlm]"`, then run:
 
 ```bash
-python benchmarks/routing_trace.py --help
+ruff check src tests
+pytest
 ```
 
-## Development milestones
-
-1. **Current (M0–M12):** package scaffold, routing trace, LRU simulation,
-   manifest, selective reads, exact no-cache execution, a pin-safe global
-   byte-budgeted cache, exact expert-major prefill, and bounded I/O/GPU
-   overlap with timeline metrics; automatic safe expert budgets and pressure
-   protection; a bounded local OpenAI-compatible server with request metrics,
-   SSE streaming, tool-call translation, thinking separation, validated
-   structured JSON output, and Qwen3.6/Gemma 4 image-VLM serving while
-   retaining exact out-of-core text-MoE execution.
-2. **Next:** image reuse/KV-prefix caching across multi-turn conversations,
-   broader model-family adapters, and explicitly scoped audio/video support.
-
-See [THEORY.md](THEORY.md), [ARCHITECTURE.md](ARCHITECTURE.md), and
-[IMPLEMENTATION.md](IMPLEMENTATION.md) for the fixed correctness constraints
-and milestone gates.
+The project is licensed under Apache-2.0.

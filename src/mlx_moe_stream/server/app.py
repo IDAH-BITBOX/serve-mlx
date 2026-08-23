@@ -217,6 +217,9 @@ class LocalGenerationService:
     def metrics_snapshot(self) -> dict[str, Any]:
         snapshot = self.metrics.snapshot()
         snapshot["registry"] = self.registry.snapshot()
+        engine = self.registry.active_engine()
+        kv_cache = getattr(engine, "kv_cache", None) if engine is not None else None
+        snapshot["kv_cache"] = kv_cache.to_dict() if kv_cache is not None else None
         return snapshot
 
     def completions(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -445,7 +448,7 @@ class LocalGenerationService:
                     active.engine.tokenizer,
                     active.prompt.text,
                     max_tokens=active.options.max_tokens,
-                    **self._mlx_generation_kwargs(active.options),
+                    **self._mlx_generation_kwargs(active.options, active.engine),
                 )
             else:
                 if active.prompt.vlm_inputs is None:
@@ -456,7 +459,7 @@ class LocalGenerationService:
                         processor,
                         active.prompt.text,
                         max_tokens=active.options.max_tokens,
-                        **self._mlx_generation_kwargs(active.options),
+                        **self._mlx_generation_kwargs(active.options, active.engine),
                     )
                 else:
                     inputs = dict(active.prompt.vlm_inputs)
@@ -474,7 +477,7 @@ class LocalGenerationService:
                         mask=mask,
                         max_tokens=active.options.max_tokens,
                         **inputs,
-                        **self._mlx_generation_kwargs(active.options),
+                        **self._mlx_generation_kwargs(active.options, active.engine),
                     )
             for response in responses:
                 if active.first_token_at is None:
@@ -498,7 +501,9 @@ class LocalGenerationService:
                 close()
 
     @staticmethod
-    def _mlx_generation_kwargs(options: GenerationOptions) -> dict[str, Any]:
+    def _mlx_generation_kwargs(
+        options: GenerationOptions, engine: StreamingEngine | None = None
+    ) -> dict[str, Any]:
         processors = make_logits_processors(
             logit_bias=options.logit_bias,
             presence_penalty=options.presence_penalty,
@@ -509,6 +514,9 @@ class LocalGenerationService:
         }
         if processors:
             kwargs["logits_processors"] = processors
+        kv_cache = getattr(engine, "kv_cache", None) if engine is not None else None
+        if kv_cache is not None:
+            kwargs.update(kv_cache.generation_kwargs())
         return kwargs
 
     def _completion_events(self, active: _ActiveGeneration) -> Iterator[dict[str, Any]]:

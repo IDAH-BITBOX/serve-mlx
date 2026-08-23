@@ -9,6 +9,7 @@ from typing import Any
 
 import mlx.nn as nn
 
+from ..kv_cache import KvCacheConfig, KvCacheDecision, make_memory_manager
 from ..manifest import ModelManifest, load_manifest
 from ..memory import MemoryBudgetConfig, MemoryBudgetDecision, MemoryBudgetManager
 from ..prefetch import PredictivePrefetchConfig, TransitionPredictor
@@ -26,25 +27,39 @@ class StreamingEngine:
     memory_manager: MemoryBudgetManager
     memory_budget: MemoryBudgetDecision
     processor: Any | None = None
+    kv_cache: KvCacheDecision | None = None
 
     def close(self) -> None:
         self.runtime.close()
 
     def generate(self, prompt: str, *, max_tokens: int = 256) -> str:
+        kv_kwargs = self.kv_cache.generation_kwargs() if self.kv_cache is not None else {}
         if self.processor is not None:
             try:
                 from mlx_vlm import generate
             except ModuleNotFoundError as error:  # pragma: no cover - optional VLM dependency
                 raise RuntimeError("VLM generation requires mlx-vlm") from error
             result = generate(
-                self.model, self.processor, prompt, max_tokens=max_tokens, verbose=False
+                self.model,
+                self.processor,
+                prompt,
+                max_tokens=max_tokens,
+                verbose=False,
+                **kv_kwargs,
             )
             return result.text
         try:
             from mlx_lm import generate
         except ModuleNotFoundError as error:  # pragma: no cover - package dependency is normal
             raise RuntimeError("streaming generation requires mlx-lm") from error
-        return generate(self.model, self.tokenizer, prompt, max_tokens=max_tokens, verbose=False)
+        return generate(
+            self.model,
+            self.tokenizer,
+            prompt,
+            max_tokens=max_tokens,
+            verbose=False,
+            **kv_kwargs,
+        )
 
 
 class Qwen3MoeAdapter:
@@ -60,6 +75,7 @@ class Qwen3MoeAdapter:
         resident_budget_bytes: int | None = None,
         auto_resident_budget: bool = False,
         memory_config: MemoryBudgetConfig | None = None,
+        kv_cache_config: KvCacheConfig | None = None,
         predictor: TransitionPredictor | None = None,
         predictive_config: PredictivePrefetchConfig | None = None,
         prefill_strategy: str = "expert_major",
@@ -100,9 +116,15 @@ class Qwen3MoeAdapter:
             # any resident expert arrays.  This is deliberately not a model
             # config estimate: MLX layout and quantization determine the live
             # Unified Memory footprint.
-            memory_manager = MemoryBudgetManager(memory_config)
+            shell_bytes = int(mx.get_active_memory())
+            memory_manager, kv_cache = make_memory_manager(
+                memory_config,
+                kv_cache_config,
+                model_config=config,
+                shell_bytes=shell_bytes,
+            )
             memory_budget = memory_manager.plan(
-                shell_bytes=int(mx.get_active_memory()),
+                shell_bytes=shell_bytes,
                 requested_expert_budget_bytes=resident_budget_bytes,
                 auto_enabled=auto_resident_budget,
                 minimum_expert_bytes=max(
@@ -150,6 +172,7 @@ class Qwen3MoeAdapter:
             runtime=runtime,
             memory_manager=memory_manager,
             memory_budget=memory_budget,
+            kv_cache=kv_cache,
         )
 
     def replace_moe_blocks(
@@ -185,6 +208,7 @@ def load_qwen3_moe_streaming(
     resident_budget_bytes: int | None = None,
     auto_resident_budget: bool = False,
     memory_config: MemoryBudgetConfig | None = None,
+    kv_cache_config: KvCacheConfig | None = None,
     predictor: TransitionPredictor | None = None,
     predictive_config: PredictivePrefetchConfig | None = None,
     prefill_strategy: str = "expert_major",
@@ -200,6 +224,7 @@ def load_qwen3_moe_streaming(
         resident_budget_bytes=resident_budget_bytes,
         auto_resident_budget=auto_resident_budget,
         memory_config=memory_config,
+        kv_cache_config=kv_cache_config,
         predictor=predictor,
         predictive_config=predictive_config,
         prefill_strategy=prefill_strategy,
