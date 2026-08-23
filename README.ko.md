@@ -55,6 +55,17 @@ MoE 전문가 가중치가 머뭅니다.
 통합 메모리를 사용합니다. 메모리 여유가 작다면 아래 장문 컨텍스트 설정처럼
 prefill 속도와 피크 메모리를 맞바꾸세요.
 
+### 256K 컨텍스트 윈도우 실측
+
+같은 M4 환경에서 Qwen3.6으로 실제 OpenAI 호환
+`/v1/chat/completions` 요청을 완료했습니다. **262,141개 prompt 토큰과 1개 생성
+토큰**, 즉 **총 262,142개 토큰**을 처리했습니다(262,144 토큰 경계보다 두 토큰
+작음). `--resident-budget off`, `--kv-cache 4bit`,
+`--prefill-step-size 1024` 구성으로 2시간 16분 28초가 걸렸고, MLX peak allocation은
+12.84GiB였습니다. 이는 256K급 **컨텍스트 윈도우** 검증이지, 256K개의 출력 토큰을
+대화형 속도로 생성한다는 뜻은 아닙니다. SSD-streamed MoE의 전체 윈도우 prefill은
+의도적으로 느린 스트레스 테스트입니다.
+
 ## 설치
 
 PyPI 정식 배포 전까지는 공개 GitHub `main`에서 바로 설치합니다. Homebrew/system

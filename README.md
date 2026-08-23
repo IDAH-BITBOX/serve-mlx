@@ -56,6 +56,17 @@ out of Unified Memory, but the model shell, active experts, and KV cache still
 need memory. Use the long-context configuration below when memory headroom is
 tight; it trades prefill speed for a lower peak allocation.
 
+### 256K context-window run
+
+On that M4 system, Qwen3.6 completed a real OpenAI-compatible
+`/v1/chat/completions` request with **262,141 prompt tokens and one generated
+token** (**262,142 total tokens**, two tokens below the 262,144-token context
+boundary). The run used `--resident-budget off`, `--kv-cache 4bit`, and
+`--prefill-step-size 1024`; it took 2 h 16 m 28 s and reported a 12.84 GiB MLX
+peak allocation. This verifies a 256K-class context window, not an interactive
+256K-token output. Full-window SSD-streamed MoE prefills are intentionally a
+slow stress test.
+
 ## Install
 
 Until the project is published to PyPI, install the current public release
