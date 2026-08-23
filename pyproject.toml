@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mlx-moe-stream"
-version = "0.1.0a3"
+version = "0.1.0a4"
 description = "Exact out-of-core MoE routing analysis and serving for MLX"
 readme = "README.md"
 requires-python = ">=3.10"

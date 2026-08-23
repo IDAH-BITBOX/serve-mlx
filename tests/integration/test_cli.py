@@ -55,11 +55,14 @@ def test_kv_cache_options_parse_for_generate_and_serve():
             "prepared/manifest.json",
             "--kv-cache",
             "4bit",
+            "--prefill-step-size",
+            "256",
         ]
     )
 
     assert (generate.kv_cache, generate.kv_max_context) == ("8bit", 8192)
     assert serve.kv_cache == "4bit"
+    assert serve.prefill_step_size == 256
     assert generate.memory_safety_margin == serve.memory_safety_margin == "auto"
 
 

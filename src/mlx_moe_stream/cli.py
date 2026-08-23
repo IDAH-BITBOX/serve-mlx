@@ -220,6 +220,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum JSON request body size (default: 1MB)",
     )
     serve.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2_048,
+        help=(
+            "tokens per prefill chunk; lower values reduce long-context MoE peak memory "
+            "at the cost of speed (default: 2048)"
+        ),
+    )
+    serve.add_argument(
         "--vision",
         action="store_true",
         help="M12: load a supported Qwen3.5/Gemma4 vision tower for image chat",
@@ -469,6 +478,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_prompt_tokens=args.max_prompt_tokens,
                 max_completion_tokens=args.max_tokens,
                 max_request_bytes=parse_bytes(args.max_request_bytes),
+                prefill_step_size=args.prefill_step_size,
             )
             registry = ModelRegistry(
                 registrations,

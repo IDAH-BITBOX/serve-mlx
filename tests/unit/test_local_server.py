@@ -353,6 +353,12 @@ def test_m12_text_completion_uses_vlm_preparation(service: LocalGenerationServic
 
 
 def test_kv_cache_generation_kwargs_are_forwarded_to_mlx(service, monkeypatch):
+    service.config = ServerConfig(
+        model_id="test-moe",
+        max_prompt_tokens=8,
+        max_completion_tokens=4,
+        prefill_step_size=256,
+    )
     assert service._legacy_engine is not None
     service._legacy_engine.kv_cache = SimpleNamespace(
         generation_kwargs=lambda: {"kv_bits": 4, "kv_group_size": 64},
@@ -370,7 +376,13 @@ def test_kv_cache_generation_kwargs_are_forwarded_to_mlx(service, monkeypatch):
     assert response["choices"][0]["text"] == "ok"
     assert captured["kv_bits"] == 4
     assert captured["kv_group_size"] == 64
+    assert captured["prefill_step_size"] == 256
     assert service.metrics_snapshot()["kv_cache"] == {"effective_mode": "4bit"}
+
+
+def test_server_config_rejects_a_nonpositive_prefill_step_size():
+    with pytest.raises(ValueError, match="prefill step size"):
+        ServerConfig(prefill_step_size=0)
 
 
 def test_metrics_include_the_active_memory_budget(service: LocalGenerationService):

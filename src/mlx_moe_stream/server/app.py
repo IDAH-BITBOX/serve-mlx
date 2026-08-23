@@ -57,6 +57,7 @@ class ServerConfig:
     max_prompt_tokens: int = 4_096
     max_completion_tokens: int = 256
     max_request_bytes: int = 1_000_000
+    prefill_step_size: int = 2_048
 
     def __post_init__(self) -> None:
         if not self.model_id:
@@ -67,6 +68,8 @@ class ServerConfig:
             raise ValueError("maximum completion tokens cannot be negative")
         if self.max_request_bytes <= 0:
             raise ValueError("maximum request bytes must be greater than zero")
+        if self.prefill_step_size <= 0:
+            raise ValueError("prefill step size must be greater than zero")
 
 
 @dataclass(frozen=True)
@@ -508,8 +511,8 @@ class LocalGenerationService:
             if callable(close):
                 close()
 
-    @staticmethod
     def _mlx_generation_kwargs(
+        self,
         options: GenerationOptions, engine: StreamingEngine | None = None
     ) -> dict[str, Any]:
         processors = make_logits_processors(
@@ -518,7 +521,10 @@ class LocalGenerationService:
             frequency_penalty=options.frequency_penalty,
         )
         kwargs: dict[str, Any] = {
-            "sampler": make_sampler(temp=options.temperature, top_p=options.top_p)
+            "sampler": make_sampler(temp=options.temperature, top_p=options.top_p),
+            # Long MoE prefills create temporary routing/activation tensors per
+            # chunk. Keep this independently tunable from the API context limit.
+            "prefill_step_size": self.config.prefill_step_size,
         }
         if processors:
             kwargs["logits_processors"] = processors
