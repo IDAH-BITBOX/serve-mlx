@@ -46,14 +46,19 @@ Memory. Start with the automatic settings and watch `/metrics`.
 ## Install
 
 Until the project is published to PyPI, install the current public release
-directly from GitHub. This is the recommended command for users:
+directly from GitHub. Do this in a Python 3.10+ virtual environment—do not
+install it into the Homebrew/system Python:
 
 ```bash
-python3 -m pip install --upgrade \
+python3.12 -m venv ~/.venvs/mlx-moe-stream
+source ~/.venvs/mlx-moe-stream/bin/activate
+python -m pip install --upgrade pip
+python -m pip install --upgrade \
   "mlx-moe-stream[vlm] @ git+https://github.com/IDAH-BITBOX/serve-mlx.git@main"
 ```
 
-`[vlm]` installs image-chat support. Omit it for text-only serving:
+`[vlm]` installs image-chat support. For text-only serving, run this after
+activating the virtual environment instead:
 
 ```bash
 python3 -m pip install --upgrade \
@@ -66,7 +71,7 @@ virtual environment instead:
 ```bash
 git clone https://github.com/IDAH-BITBOX/serve-mlx.git
 cd serve-mlx
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e .

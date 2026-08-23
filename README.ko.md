@@ -44,15 +44,19 @@ MoE 전문가 가중치가 머뭅니다.
 
 ## 설치
 
-PyPI 정식 배포 전까지는 공개 GitHub `main`에서 바로 설치합니다. 일반 사용자는
-아래 명령을 사용하세요.
+PyPI 정식 배포 전까지는 공개 GitHub `main`에서 바로 설치합니다. Homebrew/system
+Python에 설치하지 말고, Python 3.10+ 가상환경에서 아래 명령을 사용하세요.
 
 ```bash
-python3 -m pip install --upgrade \
+python3.12 -m venv ~/.venvs/mlx-moe-stream
+source ~/.venvs/mlx-moe-stream/bin/activate
+python -m pip install --upgrade pip
+python -m pip install --upgrade \
   "mlx-moe-stream[vlm] @ git+https://github.com/IDAH-BITBOX/serve-mlx.git@main"
 ```
 
-`[vlm]`은 이미지 채팅 지원을 설치합니다. 텍스트 전용이면 이를 생략할 수 있습니다.
+`[vlm]`은 이미지 채팅 지원을 설치합니다. 텍스트 전용이면 가상환경을 활성화한 뒤
+아래 명령을 사용합니다.
 
 ```bash
 python3 -m pip install --upgrade \
@@ -64,7 +68,7 @@ python3 -m pip install --upgrade \
 ```bash
 git clone https://github.com/IDAH-BITBOX/serve-mlx.git
 cd serve-mlx
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e .
