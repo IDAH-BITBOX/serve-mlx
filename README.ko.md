@@ -42,6 +42,19 @@ MoE 전문가 가중치가 머뭅니다.
 - `mlx-community/Qwen3-30B-A3B-4bit`
 - `mlx-community/gemma-4-26b-a4b-it-8bit`
 
+## M4 MacBook Pro 24GB 검증
+
+24GB 통합 메모리를 갖춘 Apple M4 MacBook Pro에서 아래 모델을 로컬 서빙하고
+추론하는 end-to-end 검증을 수행했습니다.
+
+- `mlx-community/Qwen3.6-35B-A3B-8bit`
+- `mlx-community/gemma-4-26b-a4b-it-8bit` (Gemma 4 8-bit의 정확한 저장소 ID)
+
+두 모델은 큰 MoE 체크포인트입니다. SSD streaming은 선택되지 않은 expert를 통합
+메모리에 계속 유지하지 않지만, model shell, 현재 활성 expert, KV cache는 여전히
+통합 메모리를 사용합니다. 메모리 여유가 작다면 아래 장문 컨텍스트 설정처럼
+prefill 속도와 피크 메모리를 맞바꾸세요.
+
 ## 설치
 
 PyPI 정식 배포 전까지는 공개 GitHub `main`에서 바로 설치합니다. Homebrew/system
@@ -251,6 +264,26 @@ mlx-moe-stream generate \
 `serve`에서는 `--max-prompt-tokens + --max-tokens` 값으로 KV cache 예약량을
 계산합니다. 따라서 이 두 제한은 실제 사용량에 맞게 지정해야 합니다.
 `--kv-reserve`는 최소 안전 예약량일 뿐, KV 정밀도를 정하는 옵션이 아닙니다.
+
+큰 컨텍스트의 prefill에서 Metal out-of-memory가 발생한다면
+`--prefill-step-size`를 낮추세요. 컨텍스트 한도와 별개로 한 번에 처리할 prompt
+토큰 수를 제한합니다. 값이 작을수록 일시적인 MoE 활성화 메모리는 줄지만, prefill은
+더 오래 걸립니다.
+
+```bash
+mlx-moe-stream serve \
+  --manifest prepared-qwen3.6-35b/manifest.json \
+  --model-id qwen3.6-35b-local \
+  --resident-budget off \
+  --kv-cache 4bit \
+  --max-prompt-tokens 262144 \
+  --max-tokens 1 \
+  --prefill-step-size 1024
+```
+
+이는 **컨텍스트 윈도우** 설정입니다. 256K개 출력 토큰을 즉시 생성한다는 뜻이
+아닙니다. SSD에서 expert를 스트리밍하는 MoE 모델의 전체 윈도우 prefill은 오래
+걸릴 수 있습니다.
 
 양자화 KV cache는 메모리를 줄이지만 생성 품질에 영향을 줄 수 있습니다. 짧은
 컨텍스트에서 품질이 가장 중요하면 `bf16`을, 저사양 Mac에서 큰 모델이나 긴

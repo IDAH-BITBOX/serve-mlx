@@ -43,6 +43,19 @@ Large models can reside on SSD, but they are not zero-memory models: the
 non-expert shell, the active routed experts, and the KV cache still use Unified
 Memory. Start with the automatic settings and watch `/metrics`.
 
+## M4 MacBook Pro (24GB) validation
+
+End-to-end local serving and inference have been exercised on an Apple M4
+MacBook Pro with 24GB Unified Memory using:
+
+- `mlx-community/Qwen3.6-35B-A3B-8bit`
+- `mlx-community/gemma-4-26b-a4b-it-8bit` (the exact Gemma 4 8-bit repository ID)
+
+These are large MoE checkpoints: SSD streaming keeps inactive expert weights
+out of Unified Memory, but the model shell, active experts, and KV cache still
+need memory. Use the long-context configuration below when memory headroom is
+tight; it trades prefill speed for a lower peak allocation.
+
 ## Install
 
 Until the project is published to PyPI, install the current public release
@@ -260,6 +273,25 @@ mlx-moe-stream generate \
 For `serve`, the reservation is calculated from
 `--max-prompt-tokens + --max-tokens`; set those limits honestly. `--kv-reserve`
 is a minimum safety floor, not the requested cache precision.
+
+For a large context that otherwise reaches a Metal out-of-memory error during
+prefill, lower `--prefill-step-size`. It controls how many prompt tokens are
+processed at once, independently of the context limit. Smaller values reduce
+temporary MoE activation memory but take longer:
+
+```bash
+mlx-moe-stream serve \
+  --manifest prepared-qwen3.6-35b/manifest.json \
+  --model-id qwen3.6-35b-local \
+  --resident-budget off \
+  --kv-cache 4bit \
+  --max-prompt-tokens 262144 \
+  --max-tokens 1 \
+  --prefill-step-size 1024
+```
+
+This is a **context-window** setting, not a promise of an interactive 256K-token
+output. A full-window prefill can take a long time on SSD-streamed MoE models.
 
 Quantized KV cache reduces memory use but can change generation quality. Use
 `bf16` for quality-sensitive short contexts, and prefer `auto` or `8bit`/`4bit`
