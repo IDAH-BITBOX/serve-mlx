@@ -86,6 +86,38 @@ class _Engine:
         self.closed = True
 
 
+class _VisionProcessor:
+    chat_template = "{% if tools %}tools{% endif %} {{ enable_thinking }}"
+
+    def __init__(self) -> None:
+        self.tokenizer = _Tokenizer()
+        self.chat_messages: list[dict[str, Any]] | None = None
+        self.images: list[Any] | None = None
+        self.text: str | None = None
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+        **_: Any,
+    ) -> str:
+        assert tokenize is False
+        assert add_generation_prompt is True
+        self.chat_messages = messages
+        return "VISION CHAT"
+
+    def __call__(self, *, images: list[Any] | None, text: str, **_: Any) -> dict[str, Any]:
+        self.images = images
+        self.text = text
+        return {
+            "input_ids": SimpleNamespace(size=3),
+            "pixel_values": "pixels",
+            "image_grid_thw": "grid",
+        }
+
+
 @pytest.fixture
 def service(monkeypatch: pytest.MonkeyPatch) -> LocalGenerationService:
     def fake_stream_generate(*_: Any, **__: Any):
@@ -168,6 +200,102 @@ def test_m11_streaming_stop_sequence_and_usage(
     assert text_events == ["Hello ", ""]
     assert events[1]["choices"][0]["finish_reason"] == "stop"
     assert events[-1]["usage"] == {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+
+
+def test_m12_image_chat_uses_vision_processor_and_vlm_stream(
+    service: LocalGenerationService, monkeypatch: pytest.MonkeyPatch
+):
+    assert service._legacy_engine is not None
+    processor = _VisionProcessor()
+    service._legacy_engine.processor = processor
+    captured: dict[str, Any] = {}
+    loaded_sources: list[str] = []
+
+    def fake_vlm_stream_generate(*args: Any, **kwargs: Any):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        yield _Response("a tiny image", 3, 1)
+
+    monkeypatch.setattr("mlx_moe_stream.server.app._stream_vlm_generate", fake_vlm_stream_generate)
+    monkeypatch.setattr(
+        "mlx_moe_stream.server.app._load_vlm_image",
+        lambda source: loaded_sources.append(str(source)) or object(),
+    )
+    response = service.chat_completions(
+        {
+            "model": "test-moe",
+            "reasoning_effort": "none",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.test/cat.png"},
+                        },
+                        {"type": "text", "text": "Describe it."},
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert response["choices"][0]["message"]["content"] == "a tiny image"
+    assert processor.chat_messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": processor.chat_messages[0]["content"][0]["image"]},
+                {"type": "text", "text": "Describe it."},
+            ],
+        }
+    ]
+    assert processor.images is not None and len(processor.images) == 1
+    assert loaded_sources == ["https://example.test/cat.png"]
+    assert processor.text == "VISION CHAT"
+    assert captured["args"][1] is processor
+    assert captured["kwargs"]["input_ids"].size == 3
+    assert captured["kwargs"]["pixel_values"] == "pixels"
+    assert captured["kwargs"]["image_grid_thw"] == "grid"
+
+
+def test_m12_image_chat_requires_a_vision_loaded_engine(service: LocalGenerationService):
+    with pytest.raises(ApiRequestError, match="without vision"):
+        service.chat_completions(
+            {
+                "model": "test-moe",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_image",
+                                "image_url": "https://example.test/image.png",
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+
+def test_m12_text_completion_uses_vlm_preparation(service: LocalGenerationService, monkeypatch):
+    assert service._legacy_engine is not None
+    processor = _VisionProcessor()
+    service._legacy_engine.processor = processor
+    captured: dict[str, Any] = {}
+
+    def fake_vlm_stream_generate(*args: Any, **kwargs: Any):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        yield _Response("completed", 2, 1)
+
+    monkeypatch.setattr("mlx_moe_stream.server.app._stream_vlm_generate", fake_vlm_stream_generate)
+    response = service.completions({"model": "test-moe", "prompt": "Complete this"})
+
+    assert response["choices"][0]["text"] == "completed"
+    assert captured["args"][1] is processor
+    assert "input_ids" not in captured["kwargs"]
 
 
 def test_m11_thinking_and_qwen_tool_calls(

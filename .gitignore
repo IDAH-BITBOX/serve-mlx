@@ -27,7 +27,7 @@ secrets/
 
 # Downloaded model artifacts. Source code must refer to a Hugging Face repo ID
 # or a user-supplied local path; it must never vendor multi-GB model weights.
-models/
+/models/
 checkpoints/
 weights/
 *.safetensors

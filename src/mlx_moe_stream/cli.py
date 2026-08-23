@@ -206,6 +206,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum JSON request body size (default: 1MB)",
     )
     serve.add_argument(
+        "--vision",
+        action="store_true",
+        help="M12: load a supported Qwen3.5/Gemma4 vision tower for image chat",
+    )
+    serve.add_argument(
         "--prefill-strategy",
         choices=("expert_major", "token_major"),
         default="expert_major",
@@ -454,6 +459,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     io_workers=args.io_workers,
                     prefetch_depth=args.prefetch_depth,
                     async_gpu=args.async_gpu,
+                    vision=args.vision,
                     predictor=predictor,
                     predictive_config=predictive_config,
                 ),

@@ -30,6 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.8"]
+vlm = ["mlx-vlm>=0.6.15"]
 
 [project.scripts]
 mlx-moe-stream = "mlx_moe_stream.cli:main"

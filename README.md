@@ -5,7 +5,7 @@ inference on top of [mlx-lm](https://github.com/ml-explore/mlx-lm). It keeps
 non-expert weights on the normal mlx-lm path and will stream only routed expert
 weights into an explicitly budgeted resident working set.
 
-The repository is at the M11 OpenAI-protocol milestone. It can trace
+The repository is at the M12 image-VLM protocol milestone. It can trace
 Qwen3-MoE routing, create a validated manifest for exact expert-only disk
 reads, execute the exact streaming MoE path, retain routed experts in an
 explicit byte-budgeted LRU cache, and materialize each routed prefill expert
@@ -18,7 +18,10 @@ text adapter. M9 registers multiple prepared manifests but holds at most one
 engine in Unified Memory. M10 adds strictly bounded, trace-trained next-layer
 expert prefetch. M11 adds SSE streaming, sampling controls, Qwen
 thinking/tool-call protocol translation, and validated structured JSON
-responses. It does **not** yet implement multimodal inputs.
+responses. M12 adds image chat for Qwen3.6 and Gemma 4 through `mlx-vlm` while
+keeping every routed text-MoE expert in the same SSD-backed runtime. Vision
+tower, projector, router, shared expert, and dense text weights remain in
+Unified Memory; only the selected routed experts are materialized from SSD.
 
 ## Requirements
 
@@ -33,6 +36,13 @@ responses. It does **not** yet implement multimodal inputs.
 python3.12 -m pip install -e ".[dev]"
 mlx-moe-stream --help
 pytest
+```
+
+Install the optional image-VLM processor dependency before using `serve
+--vision`:
+
+```bash
+python3.12 -m pip install -e ".[dev,vlm]"
 ```
 
 ## Capture a routing trace
@@ -100,9 +110,11 @@ mlx-moe-stream prepare \
   --output prepared-gemma4-26b
 ```
 
-These are multimodal checkpoints. M8.5 deliberately loads only their
-`language_model` text weights; image inputs and vision-tower execution are not
-exposed by `generate` or `serve`.
+Without `--vision`, these multimodal checkpoints use their text-only
+`language_model` path. M12 exposes image chat through `serve --vision`; the
+`generate` CLI remains text-only. Image VLM keeps the vision tower in Unified
+Memory and continues to stream only the routed text experts from the prepared
+manifest.
 
 ## Exact generation: M3–M5
 
@@ -247,7 +259,7 @@ choices and expert math are unchanged by all four actions.
 `--wired-limit` calls `mx.set_wired_limit()` only when explicitly supplied. No
 default mode changes macOS `sysctl` settings or requires administrator access.
 
-## Local OpenAI-compatible server (M8–M11)
+## Local OpenAI-compatible server (M8–M12)
 
 M8 loads one prepared supported-MoE manifest once, enables the M7 automatic budget
 by default, and serializes model execution to one active generation. It binds
@@ -263,6 +275,18 @@ mlx-moe-stream --verbose serve \
   --max-tokens 256
 ```
 
+For an image-capable Qwen3.6 or Gemma 4 checkpoint, enable its vision tower
+explicitly. This adds the dense vision shell to the measured M7 budget; it
+does not load the MoE expert bank.
+
+```bash
+mlx-moe-stream --verbose serve \
+  --manifest prepared-gemma4-26b/manifest.json \
+  --model-id gemma4-vision \
+  --vision \
+  --port 8000
+```
+
 The API has these endpoints:
 
 - `GET /health`
@@ -276,7 +300,7 @@ prefill/decode tok/s, cache hit rate, disk bytes, resident expert bytes, and
 MLX peak memory. A second simultaneous generation receives HTTP `429` rather
 than sharing mutable KV or expert-cache state.
 
-M11 supports `n=1` requests with this local OpenAI-compatible subset:
+M12 supports `n=1` requests with this local OpenAI-compatible subset:
 
 - `stream=true` sends `text/event-stream` chunks and ends with `data: [DONE]`.
   `stream_options: {"include_usage": true}` emits a final usage-only chunk.
@@ -293,6 +317,15 @@ M11 supports `n=1` requests with this local OpenAI-compatible subset:
   prompted and then validated locally with Draft 2020-12 JSON Schema.
   Structured responses use `stream=false` so invalid output is never committed
   before validation.
+- Image chat accepts an OpenAI-style `content` part with
+  `{"type":"image_url","image_url":{"url":"..."}}`, or the compatible
+  `{"type":"input_image","image_url":"..."}` form. The image source may
+  be an `https://` URL, a local path, or a `data:image/...` URI. Up to four
+  images are accepted in `user` messages. Image input requires an engine
+  started with `--vision`.
+
+M12 intentionally supports images only. Audio and video content parts fail
+closed with HTTP 400 rather than being treated as text or silently ignored.
 
 The server rejects a tokenizer without a declared tool-aware template rather
 than silently pretending to support `tools`.
@@ -312,22 +345,43 @@ reply = client.chat.completions.create(
 print(reply.choices[0].message.content)
 ```
 
+Image chat uses the same OpenAI client API:
+
+```python
+reply = client.chat.completions.create(
+    model="gemma4-vision",
+    reasoning_effort="none",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_image", "image_url": "/path/to/photo.png"},
+                {"type": "text", "text": "Describe the image."},
+            ],
+        }
+    ],
+    max_tokens=128,
+)
+```
+
 When a final response has `finish_reason="tool_calls"`, execute the named
 function in your own application and append its output as a `role: "tool"`
 message. The local server intentionally has no authority to run arbitrary
 functions or shell commands.
 
-M8.5 can expose one prepared Qwen3-MoE, Qwen3.5-MoE, or Gemma 4 manifest at a
-time. It is not a universal loader for dense models, image inputs, or arbitrary
-MoE layouts. Adding a family still requires an adapter that proves selective
-expert reads and preserves its specific router/expert semantics.
+M12 can expose one prepared Qwen3-MoE, Qwen3.5-MoE, or Gemma 4 manifest at a
+time. `--vision` is available for the supported Qwen3.5 and Gemma 4 VLM
+families; standard Qwen3-MoE remains text-only. This is not a universal loader
+for dense models or arbitrary MoE layouts. Adding a family still requires an
+adapter that proves selective expert reads and preserves its router/expert
+semantics.
 
 ## Lazy model registry (M9)
 
 Use repeated `--model MODEL_ID=MANIFEST` to make multiple prepared models
 discoverable through `GET /v1/models`. The server starts with **no** loaded
-engine. The first request for a model loads its text shell and streams only its
-routed experts. A request for another model closes the prior engine before
+engine. The first request for a model loads its selected text or image-VLM shell
+and streams only its routed experts. A request for another model closes the prior engine before
 opening the next one, so Qwen and Gemma shells never coexist in Unified Memory.
 
 ```bash
@@ -426,15 +480,16 @@ python benchmarks/routing_trace.py --help
 
 ## Development milestones
 
-1. **Current (M0–M11):** package scaffold, routing trace, LRU simulation,
+1. **Current (M0–M12):** package scaffold, routing trace, LRU simulation,
    manifest, selective reads, exact no-cache execution, a pin-safe global
    byte-budgeted cache, exact expert-major prefill, and bounded I/O/GPU
    overlap with timeline metrics; automatic safe expert budgets and pressure
    protection; a bounded local OpenAI-compatible server with request metrics,
-   SSE streaming, tool-call translation, thinking separation, and validated
-   structured JSON output.
-2. **Next:** M12 multimodal processor/vision-tower integration while retaining
-   exact out-of-core text-MoE execution.
+   SSE streaming, tool-call translation, thinking separation, validated
+   structured JSON output, and Qwen3.6/Gemma 4 image-VLM serving while
+   retaining exact out-of-core text-MoE execution.
+2. **Next:** image reuse/KV-prefix caching across multi-turn conversations,
+   broader model-family adapters, and explicitly scoped audio/video support.
 
 See [THEORY.md](THEORY.md), [ARCHITECTURE.md](ARCHITECTURE.md), and
 [IMPLEMENTATION.md](IMPLEMENTATION.md) for the fixed correctness constraints

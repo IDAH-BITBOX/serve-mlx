@@ -30,6 +30,7 @@ from .protocol import (
     ToolCallStreamParser,
     add_response_format_instruction,
     enforce_tool_choice,
+    image_sources,
     normalize_messages,
     parse_generation_options,
     parse_tool_calls,
@@ -132,6 +133,8 @@ class ServerMetrics:
 class _Prompt:
     text: str
     initial_reasoning: bool = False
+    vlm_inputs: dict[str, Any] | None = None
+    token_count: int | None = None
 
 
 @dataclass
@@ -345,13 +348,42 @@ class LocalGenerationService:
     def _chat_prompt(
         messages: list[dict[str, Any]], engine: StreamingEngine, options: GenerationOptions
     ) -> _Prompt:
+        processor = getattr(engine, "processor", None)
+        images = image_sources(messages)
+        if images and processor is None:
+            raise ApiRequestError(
+                "this model was loaded without vision; restart serve with --vision",
+                parameter="messages",
+            )
         rendered, initial_reasoning = render_chat_prompt(
             messages,
-            engine.tokenizer,
+            processor or engine.tokenizer,
             tools=options.template_tools,
             reasoning_effort=options.reasoning_effort,
         )
-        return _Prompt(rendered, initial_reasoning)
+        if processor is None:
+            return _Prompt(rendered, initial_reasoning)
+        try:
+            loaded_images = [_load_vlm_image(source) for source in images]
+            inputs = processor(
+                images=loaded_images or None,
+                text=rendered,
+                return_tensors="mlx",
+                padding=False,
+            )
+            input_ids = inputs.get("input_ids")
+            if input_ids is None:
+                raise ValueError("processor did not return input_ids")
+        except (ImportError, ValueError, OSError) as error:
+            raise ApiRequestError(
+                f"could not process image input: {error}", parameter="messages"
+            ) from error
+        return _Prompt(
+            rendered,
+            initial_reasoning,
+            vlm_inputs=dict(inputs),
+            token_count=int(input_ids.size),
+        )
 
     def _begin_generation(
         self,
@@ -370,7 +402,11 @@ class LocalGenerationService:
         try:
             engine = self.registry.activate(options.model_id)
             prompt = prompt_builder(engine)
-            prompt_tokens = _count_tokens(engine.tokenizer, prompt.text, add_special_tokens=True)
+            prompt_tokens = prompt.token_count
+            if prompt_tokens is None:
+                prompt_tokens = _count_tokens(
+                    engine.tokenizer, prompt.text, add_special_tokens=True
+                )
             if prompt_tokens > self.config.max_prompt_tokens:
                 raise ApiRequestError(
                     f"prompt has {prompt_tokens} tokens; limit is {self.config.max_prompt_tokens}",
@@ -402,13 +438,44 @@ class LocalGenerationService:
                 # The server serializes generation, so the process-global MLX RNG
                 # cannot race another request.
                 mx.random.seed(active.options.seed)
-            responses = stream_generate(
-                active.engine.model,
-                active.engine.tokenizer,
-                active.prompt.text,
-                max_tokens=active.options.max_tokens,
-                **self._mlx_generation_kwargs(active.options),
-            )
+            processor = getattr(active.engine, "processor", None)
+            if processor is None:
+                responses = stream_generate(
+                    active.engine.model,
+                    active.engine.tokenizer,
+                    active.prompt.text,
+                    max_tokens=active.options.max_tokens,
+                    **self._mlx_generation_kwargs(active.options),
+                )
+            else:
+                if active.prompt.vlm_inputs is None:
+                    # /v1/completions has no chat content parts. Let MLX-VLM
+                    # prepare a text-only input using its normal processor path.
+                    responses = _stream_vlm_generate(
+                        active.engine.model,
+                        processor,
+                        active.prompt.text,
+                        max_tokens=active.options.max_tokens,
+                        **self._mlx_generation_kwargs(active.options),
+                    )
+                else:
+                    inputs = dict(active.prompt.vlm_inputs)
+                    input_ids = inputs.pop("input_ids", None)
+                    if input_ids is None:
+                        raise RuntimeError("VLM prompt is missing input_ids")
+                    pixel_values = inputs.pop("pixel_values", None)
+                    mask = inputs.pop("attention_mask", None)
+                    responses = _stream_vlm_generate(
+                        active.engine.model,
+                        processor,
+                        active.prompt.text,
+                        input_ids=input_ids,
+                        pixel_values=pixel_values,
+                        mask=mask,
+                        max_tokens=active.options.max_tokens,
+                        **inputs,
+                        **self._mlx_generation_kwargs(active.options),
+                    )
             for response in responses:
                 if active.first_token_at is None:
                     active.first_token_at = time.perf_counter()
@@ -610,6 +677,26 @@ class LocalGenerationService:
         if self._legacy_engine is None:
             raise RuntimeError("the legacy engine has been closed")
         return self._legacy_engine
+
+
+def _stream_vlm_generate(*args: Any, **kwargs: Any) -> Any:
+    """Late import keeps image serving an explicit optional dependency."""
+
+    try:
+        from mlx_vlm import stream_generate as generate
+    except ModuleNotFoundError as error:  # pragma: no cover - loader already guards this
+        raise RuntimeError("VLM serving requires `pip install mlx-moe-stream[vlm]`") from error
+    return generate(*args, **kwargs)
+
+
+def _load_vlm_image(source: str) -> Any:
+    """Load one local, URL, or data-URI image with the optional VLM package."""
+
+    try:
+        from mlx_vlm.utils import load_image
+    except ModuleNotFoundError as error:  # pragma: no cover - loader already guards this
+        raise RuntimeError("VLM serving requires `pip install mlx-moe-stream[vlm]`") from error
+    return load_image(source)
 
 
 class LocalApiServer(ThreadingHTTPServer):

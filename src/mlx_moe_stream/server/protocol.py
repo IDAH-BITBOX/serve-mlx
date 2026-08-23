@@ -147,11 +147,11 @@ def parse_generation_options(
 
 
 def normalize_messages(messages: Any) -> list[Message]:
-    """Accept the text and tool-result subset of OpenAI chat messages.
+    """Normalize text and image chat content into MLX-VLM template messages.
 
-    Image/audio content arrays are intentionally rejected here: M12 owns their
-    processor and embedding path, rather than pretending that text rendering is
-    multimodal support.
+    Images use the small common shape ``{"type": "image", "image": source}``
+    expected by the Qwen and Gemma MLX-VLM processors.  Audio and video are
+    intentionally rejected: M12 exposes image VLM, not an incomplete media API.
     """
 
     if not isinstance(messages, list) or not messages:
@@ -167,13 +167,11 @@ def normalize_messages(messages: Any) -> list[Message]:
         if content is None and role == "assistant":
             content = ""
         if isinstance(content, list):
+            content = _normalize_content_parts(content, index=index, role=role)
+        if not isinstance(content, (str, list)):
             raise ApiRequestError(
-                "multimodal message content requires the M12 vision endpoint",
+                f"messages[{index}].content must be a string or content-part array",
                 parameter="messages",
-            )
-        if not isinstance(content, str):
-            raise ApiRequestError(
-                f"messages[{index}].content must be a string", parameter="messages"
             )
         item: Message = {"role": role, "content": content}
         if role == "assistant":
@@ -195,6 +193,81 @@ def normalize_messages(messages: Any) -> list[Message]:
             item["tool_call_id"] = message["tool_call_id"]
         normalized.append(item)
     return normalized
+
+
+def image_sources(messages: Iterable[Message]) -> list[str]:
+    """Extract bounded image sources after :func:`normalize_messages`."""
+
+    sources: list[str] = []
+    for message in messages:
+        content = message["content"]
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if part.get("type") == "image":
+                sources.append(part["image"])
+    if len(sources) > 4:
+        raise ApiRequestError("at most 4 images are supported per request", parameter="messages")
+    return sources
+
+
+def _normalize_content_parts(
+    parts: list[Any], *, index: int, role: str
+) -> str | list[dict[str, str]]:
+    if role == "system":
+        raise ApiRequestError(
+            f"messages[{index}].content must be a string for system messages",
+            parameter="messages",
+        )
+    if not parts:
+        raise ApiRequestError(f"messages[{index}].content must not be empty", parameter="messages")
+    normalized: list[dict[str, str]] = []
+    has_image = False
+    for part_index, part in enumerate(parts):
+        if not isinstance(part, dict):
+            raise ApiRequestError(
+                f"messages[{index}].content[{part_index}] must be an object", parameter="messages"
+            )
+        part_type = part.get("type")
+        if part_type == "text":
+            text = part.get("text")
+            if not isinstance(text, str):
+                raise ApiRequestError(
+                    f"messages[{index}].content[{part_index}].text must be a string",
+                    parameter="messages",
+                )
+            normalized.append({"type": "text", "text": text})
+            continue
+        if part_type in {"image_url", "input_image", "image"}:
+            if role != "user":
+                raise ApiRequestError(
+                    "image content is supported only in user messages", parameter="messages"
+                )
+            source = _image_source(part, part_type)
+            normalized.append({"type": "image", "image": source})
+            has_image = True
+            continue
+        if part_type in {"audio", "input_audio", "video", "input_video"}:
+            raise ApiRequestError(
+                "audio and video inputs are not supported; M12 supports images only",
+                parameter="messages",
+            )
+        raise ApiRequestError(
+            f"messages[{index}].content[{part_index}].type is unsupported",
+            parameter="messages",
+        )
+    if not has_image:
+        return "".join(part["text"] for part in normalized)
+    return normalized
+
+
+def _image_source(part: dict[str, Any], part_type: str) -> str:
+    value = part.get("image") if part_type == "image" else part.get("image_url")
+    if isinstance(value, dict):
+        value = value.get("url")
+    if not isinstance(value, str) or not value:
+        raise ApiRequestError("image content requires a non-empty image URL", parameter="messages")
+    return value
 
 
 def add_response_format_instruction(
@@ -237,6 +310,10 @@ def render_chat_prompt(
         if template_tools:
             raise ApiRequestError(
                 "selected tokenizer has no tool-aware chat template", parameter="tools"
+            )
+        if image_sources(messages):
+            raise ApiRequestError(
+                "selected model has no vision chat template", parameter="messages"
             )
         rendered = "\n".join(f"{message['role']}: {message['content']}" for message in messages)
         return rendered, False
