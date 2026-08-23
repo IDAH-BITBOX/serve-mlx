@@ -256,6 +256,33 @@ mlx-moe-stream generate \
 컨텍스트에서 품질이 가장 중요하면 `bf16`을, 저사양 Mac에서 큰 모델이나 긴
 컨텍스트를 다룬다면 `auto`, `8bit`, `4bit`을 권장합니다.
 
+### 통합 메모리 여유 확보
+
+이제 기본값인 `--memory-safety-margin auto`는 물리 통합 메모리의 25%를 expert
+cache에 배정하지 않고 남겨 둡니다. 8GB Mac은 2GiB, 16GB Mac은 4GiB, 24GB Mac은
+6GiB를 확보하며 최대 8GiB로 제한합니다. 실제 계산 결과는 `/metrics`의
+`memory_budget`에서 확인할 수 있습니다.
+
+더 큰 여유가 필요하면 resident cache를 명시적으로 제한하고 예약량을 늘리세요.
+
+```bash
+mlx-moe-stream serve \
+  --manifest prepared-qwen3.6-35b/manifest.json \
+  --model-id qwen3.6-35b-local \
+  --vision \
+  --resident-budget 2GiB \
+  --memory-safety-margin 8GiB \
+  --scratch-reserve 2GiB \
+  --kv-cache 4bit \
+  --max-prompt-tokens 2048 \
+  --max-tokens 128
+```
+
+안전 여유는 resident expert cache에서 제외되지만, 모든 모델이 어느 Mac에서나
+실행된다는 보장은 아닙니다. 특히 35B 모델은 non-expert shell만으로 8GB·16GB
+Mac의 한계를 넘을 수 있습니다. 이 경우 M7은 swap으로 시스템 전체를 멈추게 하는
+대신 expert-cache 계획을 거부합니다.
+
 ## 여러 모델 서빙하기
 
 여러 manifest를 ID로 등록할 수 있습니다. `/v1/models`에 모두 노출되지만, 통합

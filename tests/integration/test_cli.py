@@ -25,6 +25,13 @@ def test_serve_requires_a_manifest():
         main(["serve"])
 
 
+def test_serve_help_renders_the_auto_memory_safety_margin(capsys):
+    with pytest.raises(SystemExit, match="0"):
+        main(["serve", "--help"])
+
+    assert "reserves 25% of physical memory" in capsys.readouterr().out
+
+
 def test_kv_cache_options_parse_for_generate_and_serve():
     parser = build_parser()
 
@@ -53,6 +60,7 @@ def test_kv_cache_options_parse_for_generate_and_serve():
 
     assert (generate.kv_cache, generate.kv_max_context) == ("8bit", 8192)
     assert serve.kv_cache == "4bit"
+    assert generate.memory_safety_margin == serve.memory_safety_margin == "auto"
 
 
 def test_serve_rejects_non_loopback_hosts_before_loading_a_model(tmp_path: Path):

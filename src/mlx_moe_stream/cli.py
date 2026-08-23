@@ -12,7 +12,7 @@ from .config import parse_bytes, parse_resident_budget
 from .errors import MlxMoeStreamError
 from .kv_cache import KvCacheConfig
 from .logging import configure_logging
-from .memory import MemoryBudgetConfig
+from .memory import MemoryBudgetConfig, automatic_safety_margin_bytes, collect_memory_snapshot
 from .models import load_streaming_model
 from .prefetch import (
     PredictivePrefetchConfig,
@@ -99,8 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generate.add_argument(
         "--memory-safety-margin",
-        default="2GB",
-        help="M7 Unified Memory margin excluded from auto/explicit cache budgets (default: 2GB)",
+        default="auto",
+        help=(
+            "M7 Unified Memory kept free from expert cache; auto reserves 25%% of physical "
+            "memory (default: auto)"
+        ),
     )
     generate.add_argument(
         "--kv-reserve",
@@ -184,7 +187,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="M4/M7 expert-cache capacity (default: auto)",
     )
-    serve.add_argument("--memory-safety-margin", default="2GB")
+    serve.add_argument(
+        "--memory-safety-margin",
+        default="auto",
+        help=(
+            "M7 Unified Memory kept free from expert cache; auto reserves 25%% of physical "
+            "memory (default: auto)"
+        ),
+    )
     serve.add_argument(
         "--kv-reserve",
         default="1GB",
@@ -293,12 +303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.max_tokens < 0:
                 raise ValueError("--max-tokens must be zero or greater")
             resident_budget, auto_resident_budget = parse_resident_budget(args.resident_budget)
-            memory_config = MemoryBudgetConfig(
-                safety_margin_bytes=parse_bytes(args.memory_safety_margin),
-                kv_reserve_bytes=parse_bytes(args.kv_reserve),
-                scratch_reserve_bytes=parse_bytes(args.scratch_reserve),
-                wired_limit_bytes=(parse_bytes(args.wired_limit) if args.wired_limit else None),
-            )
+            memory_config = _memory_config(args)
             predictor, predictive_config = _predictive_options(args)
             kv_cache_config = KvCacheConfig(
                 mode=args.kv_cache,
@@ -446,12 +451,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not 1 <= args.port <= 65_535:
                 raise ValueError("--port must be in 1..65535")
             resident_budget, auto_resident_budget = parse_resident_budget(args.resident_budget)
-            memory_config = MemoryBudgetConfig(
-                safety_margin_bytes=parse_bytes(args.memory_safety_margin),
-                kv_reserve_bytes=parse_bytes(args.kv_reserve),
-                scratch_reserve_bytes=parse_bytes(args.scratch_reserve),
-                wired_limit_bytes=(parse_bytes(args.wired_limit) if args.wired_limit else None),
-            )
+            memory_config = _memory_config(args)
             predictor, predictive_config = _predictive_options(args)
             kv_cache_config = KvCacheConfig(
                 mode=args.kv_cache,
@@ -532,6 +532,23 @@ def _serve_registrations(
     if not model_specs:
         raise ValueError("serve requires --manifest or at least one --model MODEL_ID=MANIFEST")
     return tuple(ModelRegistration.parse(value) for value in model_specs)
+
+
+def _memory_config(args: argparse.Namespace) -> MemoryBudgetConfig:
+    """Resolve one CLI memory policy before the model shell is loaded."""
+
+    margin = args.memory_safety_margin
+    if isinstance(margin, str) and margin.lower() == "auto":
+        snapshot = collect_memory_snapshot(include_os_metrics=False)
+        safety_margin_bytes = automatic_safety_margin_bytes(snapshot.physical_memory_bytes)
+    else:
+        safety_margin_bytes = parse_bytes(margin)
+    return MemoryBudgetConfig(
+        safety_margin_bytes=safety_margin_bytes,
+        kv_reserve_bytes=parse_bytes(args.kv_reserve),
+        scratch_reserve_bytes=parse_bytes(args.scratch_reserve),
+        wired_limit_bytes=(parse_bytes(args.wired_limit) if args.wired_limit else None),
+    )
 
 
 def _add_kv_cache_options(parser: argparse.ArgumentParser, *, include_max_context: bool) -> None:

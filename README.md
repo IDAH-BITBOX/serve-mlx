@@ -265,6 +265,33 @@ Quantized KV cache reduces memory use but can change generation quality. Use
 `bf16` for quality-sensitive short contexts, and prefer `auto` or `8bit`/`4bit`
 when serving a large model on a smaller-memory Mac.
 
+### Preserve Unified Memory headroom
+
+`--memory-safety-margin auto` is now the default. It reserves 25% of physical
+Unified Memory from the expert cache: 2 GiB on an 8 GiB Mac, 4 GiB on a 16 GiB
+Mac, and 6 GiB on a 24 GiB Mac (capped at 8 GiB). See the active decision in
+`/metrics` under `memory_budget`.
+
+For even more free memory, use an explicit cache cap and larger reserves:
+
+```bash
+mlx-moe-stream serve \
+  --manifest prepared-qwen3.6-35b/manifest.json \
+  --model-id qwen3.6-35b-local \
+  --vision \
+  --resident-budget 2GiB \
+  --memory-safety-margin 8GiB \
+  --scratch-reserve 2GiB \
+  --kv-cache 4bit \
+  --max-prompt-tokens 2048 \
+  --max-tokens 128
+```
+
+The safety margin is deliberately excluded from the resident expert cache; it
+is not a promise that every model can fit. In particular, a 35B model may have
+a non-expert shell too large for an 8 GiB or 16 GiB Mac. In that case M7 rejects
+the expert-cache plan instead of using swap and making the machine unresponsive.
+
 ## Multiple models
 
 Register several prepared manifests with IDs. This exposes all of them through

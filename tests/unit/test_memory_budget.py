@@ -6,7 +6,12 @@ import pytest
 
 from mlx_moe_stream.cache import ExpertKey, ResidentCache, ResidentExpert
 from mlx_moe_stream.errors import MemoryPressureError
-from mlx_moe_stream.memory import MemoryBudgetConfig, MemoryBudgetManager, MemorySnapshot
+from mlx_moe_stream.memory import (
+    MemoryBudgetConfig,
+    MemoryBudgetManager,
+    MemorySnapshot,
+    automatic_safety_margin_bytes,
+)
 
 
 def _snapshot(*, active: int = 0) -> MemorySnapshot:
@@ -31,6 +36,15 @@ def _provider(snapshots: list[MemorySnapshot]) -> Iterator[MemorySnapshot]:
 
 def _expert(key: ExpertKey, nbytes: int) -> ResidentExpert:
     return ResidentExpert(key=key, arrays={}, nbytes=nbytes, last_used_step=0)
+
+
+def test_automatic_safety_margin_preserves_a_quarter_of_small_mac_memory():
+    gib = 1024**3
+
+    assert automatic_safety_margin_bytes(8 * gib) == 2 * gib
+    assert automatic_safety_margin_bytes(16 * gib) == 4 * gib
+    assert automatic_safety_margin_bytes(24 * gib) == 6 * gib
+    assert automatic_safety_margin_bytes(64 * gib) == 8 * gib
 
 
 def test_auto_budget_measures_shell_and_reservations_before_cache_allocation():

@@ -226,6 +226,8 @@ class LocalGenerationService:
         engine = self.registry.active_engine()
         kv_cache = getattr(engine, "kv_cache", None) if engine is not None else None
         snapshot["kv_cache"] = kv_cache.to_dict() if kv_cache is not None else None
+        memory_budget = getattr(engine, "memory_budget", None) if engine is not None else None
+        snapshot["memory_budget"] = memory_budget.to_dict() if memory_budget is not None else None
         return snapshot
 
     def completions(self, payload: dict[str, Any]) -> dict[str, Any]:

@@ -16,6 +16,21 @@ from .errors import MemoryPressureError
 BudgetSource = Literal["auto", "explicit", "disabled"]
 PressureAction = Literal["none", "disable_prefetch", "evict", "shrink", "reject"]
 
+_GIB = 1024**3
+
+
+def automatic_safety_margin_bytes(physical_memory_bytes: int) -> int:
+    """Reserve a quarter of physical Unified Memory, bounded for local serving.
+
+    The automatic CLI profile preserves 2 GiB on 8 GiB Macs, 4 GiB on 16 GiB
+    Macs, and 6 GiB on 24 GiB Macs.  Its 8 GiB cap keeps the policy useful on
+    high-memory Macs while still leaving room for a local model process.
+    """
+
+    if physical_memory_bytes <= 0:
+        raise ValueError("automatic M7 safety margin requires known physical memory")
+    return min(8 * _GIB, max(2 * _GIB, physical_memory_bytes // 4))
+
 
 @dataclass(frozen=True)
 class MemorySnapshot:

@@ -373,6 +373,16 @@ def test_kv_cache_generation_kwargs_are_forwarded_to_mlx(service, monkeypatch):
     assert service.metrics_snapshot()["kv_cache"] == {"effective_mode": "4bit"}
 
 
+def test_metrics_include_the_active_memory_budget(service: LocalGenerationService):
+    assert service._legacy_engine is not None
+    service._legacy_engine.memory_budget = SimpleNamespace(
+        to_dict=lambda: {"expert_budget_bytes": 2}
+    )
+    service.completions({"model": "test-moe", "prompt": "hello"})
+
+    assert service.metrics_snapshot()["memory_budget"] == {"expert_budget_bytes": 2}
+
+
 def test_m11_thinking_and_qwen_tool_calls(
     service: LocalGenerationService, monkeypatch: pytest.MonkeyPatch
 ):
