@@ -67,6 +67,29 @@ peak allocation. This verifies a 256K-class context window, not an interactive
 256K-token output. Full-window SSD-streamed MoE prefills are intentionally a
 slow stress test.
 
+### Sustained-workload and hardware-care notice
+
+Long generations can keep the CPU/GPU and SSD I/O busy for hours. This is a
+supported workload, not an instruction to defeat the Mac's thermal safeguards:
+Apple laptops monitor internal temperature and cool critical components
+automatically. It can make the enclosure warm and, on fan-equipped models,
+raise fan speed. Use a stable, hard surface with unobstructed ventilation in a
+10–35 °C room; never run it on bedding, a pillow, or inside a bag. See
+[Apple's temperature guidance](https://support.apple.com/en-us/102336).
+
+The main long-term consideration is the battery, not a single inference run.
+Lithium-ion battery aging is affected by temperature history and charging
+patterns. For repeated multi-hour serving, use a reliable power adapter, keep
+**Optimized Battery Charging** / a sensible **Charge Limit** enabled, and pause
+the job if the Mac becomes unusually hot or reports a temperature/charging
+warning. See [Apple's Apple-silicon battery-health guidance](https://support.apple.com/en-mide/102589)
+and [charge-limit guidance](https://support.apple.com/en-au/102338).
+
+SSD-streamed inference is predominantly **read** I/O, so it is not normally a
+material SSD-endurance concern. The writes to watch are model downloads,
+repeated conversion/quantization, large traces, and application logs. Keep
+those outputs bounded, and ensure free disk space remains available.
+
 ## Install
 
 Until the project is published to PyPI, install the current public release
