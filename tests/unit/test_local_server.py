@@ -45,6 +45,28 @@ class _Tokenizer:
         return "CHAT " + " ".join(message["content"] for message in messages)
 
 
+class _QwenTokenizer(_Tokenizer):
+    chat_template = "{% if tools %}tools{% endif %} {{ enable_thinking }}"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.template_kwargs: dict[str, Any] = {}
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+        **kwargs: Any,
+    ) -> str:
+        assert tokenize is False
+        assert add_generation_prompt is True
+        self.chat_messages = messages
+        self.template_kwargs = kwargs
+        return "CHAT " + " ".join(str(message["content"]) for message in messages)
+
+
 class _Engine:
     def __init__(self) -> None:
         self.closed = False
@@ -101,7 +123,7 @@ def test_generation_limits_and_single_active_generation_are_explicit(
 ):
     with pytest.raises(ApiRequestError, match="server limit"):
         service.completions({"model": "test-moe", "prompt": "hello", "max_tokens": 5})
-    with pytest.raises(ApiRequestError, match="not implemented"):
+    with pytest.raises(ApiRequestError, match="streaming completion transport"):
         service.completions({"model": "test-moe", "prompt": "hello", "stream": True})
     with pytest.raises(ApiRequestError, match="limit is 8"):
         service.completions(
@@ -115,6 +137,157 @@ def test_generation_limits_and_single_active_generation_are_explicit(
         assert error.value.status == 429
     finally:
         service._generation_slot.release()
+
+
+def test_m11_streaming_stop_sequence_and_usage(
+    service: LocalGenerationService, monkeypatch: pytest.MonkeyPatch
+):
+    def fake_stream_generate(*_: Any, **__: Any):
+        yield _Response("Hello E", 1, 1)
+        yield _Response("ND ignored", 1, 2)
+
+    monkeypatch.setattr("mlx_moe_stream.server.app.stream_generate", fake_stream_generate)
+    events = list(
+        service.completion_events(
+            {
+                "model": "test-moe",
+                "prompt": "hello",
+                "stream": True,
+                "stop": "END",
+                "stream_options": {"include_usage": True},
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "presence_penalty": 0.1,
+                "frequency_penalty": -0.1,
+                "logit_bias": {"7": 1.0},
+            }
+        )
+    )
+
+    text_events = [event["choices"][0]["text"] for event in events if event["choices"]]
+    assert text_events == ["Hello ", ""]
+    assert events[1]["choices"][0]["finish_reason"] == "stop"
+    assert events[-1]["usage"] == {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+
+
+def test_m11_thinking_and_qwen_tool_calls(
+    service: LocalGenerationService, monkeypatch: pytest.MonkeyPatch
+):
+    assert service._legacy_engine is not None
+    service._legacy_engine.tokenizer = _QwenTokenizer()
+
+    def fake_stream_generate(*_: Any, **__: Any):
+        yield _Response("route first</think>\n<tool_call>\n<function=get_weather>\n", 2, 1)
+        yield _Response('<parameter=city>\n"Seoul"\n</parameter>\n</function>\n</tool_call>', 2, 2)
+
+    monkeypatch.setattr("mlx_moe_stream.server.app.stream_generate", fake_stream_generate)
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        },
+    }
+    response = service.chat_completions(
+        {
+            "model": "test-moe",
+            "messages": [{"role": "user", "content": "Seoul weather?"}],
+            "tools": [tool],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+        }
+    )
+    message = response["choices"][0]["message"]
+    assert message["content"] is None
+    assert message["reasoning_content"] == "route first"
+    assert message["tool_calls"][0]["function"] == {
+        "name": "get_weather",
+        "arguments": '{"city":"Seoul"}',
+    }
+    assert response["choices"][0]["finish_reason"] == "tool_calls"
+    assert service.engine is not None
+    assert service.engine.tokenizer.template_kwargs["tools"] == [tool]
+
+
+def test_m11_streaming_chat_separates_thinking_and_tool_delta(
+    service: LocalGenerationService, monkeypatch: pytest.MonkeyPatch
+):
+    assert service._legacy_engine is not None
+    service._legacy_engine.tokenizer = _QwenTokenizer()
+
+    def fake_stream_generate(*_: Any, **__: Any):
+        yield _Response("plan", 2, 1)
+        yield _Response("</think>\n<tool_call><function=get_time>", 2, 2)
+        yield _Response("</function></tool_call>", 2, 3)
+
+    monkeypatch.setattr("mlx_moe_stream.server.app.stream_generate", fake_stream_generate)
+    events = list(
+        service.chat_completion_events(
+            {
+                "model": "test-moe",
+                "messages": [{"role": "user", "content": "time?"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "get_time", "parameters": {"type": "object"}},
+                    }
+                ],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+        )
+    )
+    deltas = [event["choices"][0]["delta"] for event in events if event["choices"]]
+    assert deltas[0] == {"role": "assistant"}
+    assert {"reasoning_content": "plan"} in deltas
+    tool_delta = next(delta for delta in deltas if "tool_calls" in delta)
+    assert tool_delta["tool_calls"][0]["function"] == {"name": "get_time", "arguments": "{}"}
+    assert events[-2]["choices"][0]["finish_reason"] == "tool_calls"
+    assert events[-1]["usage"]["completion_tokens"] == 3
+
+
+def test_m11_json_schema_response_is_checked(
+    service: LocalGenerationService, monkeypatch: pytest.MonkeyPatch
+):
+    service.config = ServerConfig(
+        model_id="test-moe", max_prompt_tokens=128, max_completion_tokens=4
+    )
+    assert service._legacy_engine is not None
+    service._legacy_engine.tokenizer = _QwenTokenizer()
+
+    def fake_stream_generate(*_: Any, **__: Any):
+        yield _Response('{"answer":"ok"}', 2, 1)
+
+    monkeypatch.setattr("mlx_moe_stream.server.app.stream_generate", fake_stream_generate)
+    response = service.chat_completions(
+        {
+            "model": "test-moe",
+            "messages": [{"role": "user", "content": "answer"}],
+            "reasoning_effort": "none",
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        }
+    )
+    assert response["choices"][0]["message"]["content"] == '{"answer":"ok"}'
+
+    with pytest.raises(ApiRequestError, match="streaming structured output"):
+        service.chat_completion_events(
+            {
+                "model": "test-moe",
+                "messages": [{"role": "user", "content": "answer"}],
+                "stream": True,
+                "response_format": {"type": "json_object"},
+            }
+        )
 
 
 def test_http_endpoints_return_openai_json(service: LocalGenerationService):
@@ -137,6 +310,38 @@ def test_http_endpoints_return_openai_json(service: LocalGenerationService):
             _post_json(f"{base_url}/v1/completions", {"model": "wrong", "prompt": "hello"})
         assert error.value.code == 404
         assert json.loads(error.value.read())["error"]["code"] == "model_not_found"
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=2)
+
+
+def test_http_sse_streams_openai_chunks_and_done(service: LocalGenerationService):
+    server = LocalApiServer("127.0.0.1", 0, service)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    host, port = server.server_address[:2]
+    request = urllib.request.Request(
+        f"http://{host}:{port}/v1/chat/completions",
+        data=json.dumps(
+            {
+                "model": "test-moe",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:  # noqa: S310 - localhost test
+            assert response.headers.get_content_type() == "text/event-stream"
+            body = response.read().decode("utf-8")
+        assert '"role":"assistant"' in body
+        assert '"content":"hello"' in body
+        assert '"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}' in body
+        assert body.endswith("data: [DONE]\n\n")
     finally:
         server.shutdown()
         server.server_close()

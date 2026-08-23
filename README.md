@@ -5,7 +5,7 @@ inference on top of [mlx-lm](https://github.com/ml-explore/mlx-lm). It keeps
 non-expert weights on the normal mlx-lm path and will stream only routed expert
 weights into an explicitly budgeted resident working set.
 
-The repository is at the M10 predictive-prefetch milestone. It can trace
+The repository is at the M11 OpenAI-protocol milestone. It can trace
 Qwen3-MoE routing, create a validated manifest for exact expert-only disk
 reads, execute the exact streaming MoE path, retain routed experts in an
 explicit byte-budgeted LRU cache, and materialize each routed prefill expert
@@ -16,7 +16,9 @@ M8 exposes one loaded engine through a bounded localhost OpenAI-compatible API.
 M8.5 dispatches a prepared checkpoint to an exact Qwen3, Qwen3.5, or Gemma 4
 text adapter. M9 registers multiple prepared manifests but holds at most one
 engine in Unified Memory. M10 adds strictly bounded, trace-trained next-layer
-expert prefetch. It does **not** yet implement multimodal inputs.
+expert prefetch. M11 adds SSE streaming, sampling controls, Qwen
+thinking/tool-call protocol translation, and validated structured JSON
+responses. It does **not** yet implement multimodal inputs.
 
 ## Requirements
 
@@ -245,7 +247,7 @@ choices and expert math are unchanged by all four actions.
 `--wired-limit` calls `mx.set_wired_limit()` only when explicitly supplied. No
 default mode changes macOS `sysctl` settings or requires administrator access.
 
-## Local OpenAI-compatible server (M8 / M8.5 / M9)
+## Local OpenAI-compatible server (M8–M11)
 
 M8 loads one prepared supported-MoE manifest once, enables the M7 automatic budget
 by default, and serializes model execution to one active generation. It binds
@@ -274,9 +276,26 @@ prefill/decode tok/s, cache hit rate, disk bytes, resident expert bytes, and
 MLX peak memory. A second simultaneous generation receives HTTP `429` rather
 than sharing mutable KV or expert-cache state.
 
-The M8 protocol supports non-streaming, greedy `n=1` requests. `stream=true`,
-sampling controls, tools, and structured response formats are explicitly
-rejected rather than silently ignored.
+M11 supports `n=1` requests with this local OpenAI-compatible subset:
+
+- `stream=true` sends `text/event-stream` chunks and ends with `data: [DONE]`.
+  `stream_options: {"include_usage": true}` emits a final usage-only chunk.
+- `temperature`, `top_p`, `seed`, `presence_penalty`, `frequency_penalty`,
+  `logit_bias`, and up to four `stop` sequences map to MLX sampler/logit
+  processors. Stop prefixes are withheld so they cannot leak into SSE output.
+- Qwen templates that declare `enable_thinking` expose `<think>` output as
+  `message.reasoning_content` (or `delta.reasoning_content` while streaming).
+  `reasoning_effort: "none"` requests the template's no-thinking form.
+- Function `tools` and `tool_choice` use a tokenizer's tool-aware chat
+  template. Qwen XML tool calls become OpenAI `tool_calls`; the server never
+  executes a tool. Send a `role: "tool"` result in the next client request.
+- `response_format` supports `json_object` and `json_schema`, which are
+  prompted and then validated locally with Draft 2020-12 JSON Schema.
+  Structured responses use `stream=false` so invalid output is never committed
+  before validation.
+
+The server rejects a tokenizer without a declared tool-aware template rather
+than silently pretending to support `tools`.
 
 Use it with the OpenAI Python client (the client is optional; it is not a
 server dependency):
@@ -292,6 +311,11 @@ reply = client.chat.completions.create(
 )
 print(reply.choices[0].message.content)
 ```
+
+When a final response has `finish_reason="tool_calls"`, execute the named
+function in your own application and append its output as a `role: "tool"`
+message. The local server intentionally has no authority to run arbitrary
+functions or shell commands.
 
 M8.5 can expose one prepared Qwen3-MoE, Qwen3.5-MoE, or Gemma 4 manifest at a
 time. It is not a universal loader for dense models, image inputs, or arbitrary
@@ -402,12 +426,15 @@ python benchmarks/routing_trace.py --help
 
 ## Development milestones
 
-1. **Current (M0–M8):** package scaffold, routing trace, LRU simulation,
+1. **Current (M0–M11):** package scaffold, routing trace, LRU simulation,
    manifest, selective reads, exact no-cache execution, a pin-safe global
    byte-budgeted cache, exact expert-major prefill, and bounded I/O/GPU
    overlap with timeline metrics; automatic safe expert budgets and pressure
-   protection; a bounded local OpenAI-compatible server with request metrics.
-2. **Later:** M9 predictive prefetch and M10 packed-format/Metal optimization.
+   protection; a bounded local OpenAI-compatible server with request metrics,
+   SSE streaming, tool-call translation, thinking separation, and validated
+   structured JSON output.
+2. **Next:** M12 multimodal processor/vision-tower integration while retaining
+   exact out-of-core text-MoE execution.
 
 See [THEORY.md](THEORY.md), [ARCHITECTURE.md](ARCHITECTURE.md), and
 [IMPLEMENTATION.md](IMPLEMENTATION.md) for the fixed correctness constraints

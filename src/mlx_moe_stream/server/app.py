@@ -1,4 +1,4 @@
-"""Bounded localhost OpenAI-compatible API with M9 lazy model switching."""
+"""Bounded localhost OpenAI-compatible API with streaming M11 protocol support."""
 
 from __future__ import annotations
 
@@ -7,44 +7,44 @@ import logging
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urlparse
 
+import mlx.core as mx
 from mlx_lm import stream_generate
+from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
 from ..errors import MemoryPressureError
 from ..models import StreamingEngine
+from .protocol import (
+    ApiRequestError,
+    Endpoint,
+    GenerationOptions,
+    StopSequenceBuffer,
+    ThinkingStreamParser,
+    ToolCallStreamParser,
+    add_response_format_instruction,
+    enforce_tool_choice,
+    normalize_messages,
+    parse_generation_options,
+    parse_tool_calls,
+    render_chat_prompt,
+    split_reasoning,
+    validate_structured_output,
+)
 from .registry import ModelRegistration, ModelRegistry
 
 LOGGER = logging.getLogger(__name__)
-Endpoint = Literal["completion", "chat_completion"]
-
-
-class ApiRequestError(ValueError):
-    """An OpenAI-shaped request that this deliberately small server rejects."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        status: HTTPStatus = HTTPStatus.BAD_REQUEST,
-        parameter: str | None = None,
-        code: str | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.status = status
-        self.parameter = parameter
-        self.code = code
 
 
 @dataclass(frozen=True)
 class ServerConfig:
-    """Intentional M8/M9 limits for serialized local generation."""
+    """Deliberate limits for a serialized local streaming server."""
 
     model_id: str = "mlx-moe-stream"
     max_prompt_tokens: int = 4_096
@@ -55,11 +55,11 @@ class ServerConfig:
         if not self.model_id:
             raise ValueError("default model ID cannot be empty")
         if self.max_prompt_tokens <= 0:
-            raise ValueError("M8 maximum prompt tokens must be greater than zero")
+            raise ValueError("maximum prompt tokens must be greater than zero")
         if self.max_completion_tokens < 0:
-            raise ValueError("M8 maximum completion tokens cannot be negative")
+            raise ValueError("maximum completion tokens cannot be negative")
         if self.max_request_bytes <= 0:
-            raise ValueError("M8 maximum request bytes must be greater than zero")
+            raise ValueError("maximum request bytes must be greater than zero")
 
 
 @dataclass(frozen=True)
@@ -83,7 +83,7 @@ class GenerationMetric:
 
 
 class ServerMetrics:
-    """Thread-safe M8 aggregate and last-request observability state."""
+    """Thread-safe M8–M11 aggregate and last-request observability state."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -128,6 +128,28 @@ class ServerMetrics:
             }
 
 
+@dataclass(frozen=True)
+class _Prompt:
+    text: str
+    initial_reasoning: bool = False
+
+
+@dataclass
+class _ActiveGeneration:
+    request_id: str
+    model_id: str
+    endpoint: Endpoint
+    engine: StreamingEngine
+    prompt: _Prompt
+    prompt_tokens: int
+    options: GenerationOptions
+    started: float
+    first_token_at: float | None = None
+    completion_tokens: int = 0
+    stopped: bool = False
+    settled: bool = False
+
+
 class LocalGenerationService:
     """Serialize generation and lazily keep one selected engine in memory."""
 
@@ -157,7 +179,7 @@ class LocalGenerationService:
 
     @property
     def engine(self) -> StreamingEngine | None:
-        """The current engine, retained for M8 embedding compatibility."""
+        """The current engine, retained for embedding compatibility."""
 
         return self.registry.active_engine()
 
@@ -198,135 +220,146 @@ class LocalGenerationService:
         prompt = payload.get("prompt")
         if not isinstance(prompt, str):
             raise ApiRequestError("'prompt' must be a string", parameter="prompt")
-        model_id, max_tokens = self._validate_generation_options(payload)
-        result, metric = self._generate(
-            model_id=model_id,
-            prompt_builder=lambda _: prompt,
-            max_tokens=max_tokens,
+        options = self._options(payload, endpoint="completion")
+        if options.stream:
+            raise ApiRequestError(
+                "use the streaming completion transport for stream=true", parameter="stream"
+            )
+        active = self._begin_generation(
+            options=options,
             endpoint="completion",
+            prompt_builder=lambda _: _Prompt(prompt),
         )
+        try:
+            result = self._collect_text(active)
+        except BaseException:
+            self._fail_generation(active)
+            raise
+        metric = self._complete_generation(active)
         return {
             "id": metric.request_id,
             "object": "text_completion",
             "created": int(time.time()),
-            "model": model_id,
+            "model": options.model_id,
             "choices": [
                 {
                     "text": result,
                     "index": 0,
                     "logprobs": None,
-                    "finish_reason": _finish_reason(metric.completion_tokens, max_tokens),
+                    "finish_reason": _finish_reason(active),
                 }
             ],
             "usage": _usage(metric),
         }
 
     def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
-        messages = self._normalize_messages(payload.get("messages"))
-        model_id, max_tokens = self._validate_generation_options(payload)
-        result, metric = self._generate(
-            model_id=model_id,
-            prompt_builder=lambda engine: self._render_chat_prompt(messages, engine.tokenizer),
-            max_tokens=max_tokens,
-            endpoint="chat_completion",
+        options = self._options(payload, endpoint="chat_completion")
+        messages = add_response_format_instruction(
+            normalize_messages(payload.get("messages")), options.response_format
         )
+        if options.stream:
+            raise ApiRequestError(
+                "use the streaming chat transport for stream=true", parameter="stream"
+            )
+        active = self._begin_generation(
+            options=options,
+            endpoint="chat_completion",
+            prompt_builder=lambda engine: self._chat_prompt(messages, engine, options),
+        )
+        try:
+            raw_result = self._collect_text(active)
+            reasoning, visible = split_reasoning(
+                raw_result, initial_reasoning=active.prompt.initial_reasoning
+            )
+            visible, tool_calls = parse_tool_calls(
+                visible, {tool["function"]["name"] for tool in options.template_tools}
+            )
+            enforce_tool_choice(options, tool_calls)
+            validate_structured_output(visible, options.response_format)
+        except BaseException:
+            self._fail_generation(active)
+            raise
+        metric = self._complete_generation(active)
+        message: dict[str, Any] = {"role": "assistant", "content": visible or None}
+        if reasoning:
+            message["reasoning_content"] = reasoning
+        if tool_calls:
+            message["tool_calls"] = tool_calls
         return {
             "id": metric.request_id,
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": model_id,
+            "model": options.model_id,
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": result},
-                    "finish_reason": _finish_reason(metric.completion_tokens, max_tokens),
+                    "message": message,
+                    "finish_reason": "tool_calls" if tool_calls else _finish_reason(active),
                 }
             ],
             "usage": _usage(metric),
         }
 
-    def _validate_generation_options(self, payload: dict[str, Any]) -> tuple[str, int]:
-        model = payload.get("model", self.config.model_id)
-        if not isinstance(model, str) or not self.registry.contains(model):
+    def completion_events(self, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str):
+            raise ApiRequestError("'prompt' must be a string", parameter="prompt")
+        options = self._options(payload, endpoint="completion")
+        if not options.stream:
             raise ApiRequestError(
-                f"unknown local model {model!r}",
-                status=HTTPStatus.NOT_FOUND,
-                parameter="model",
-                code="model_not_found",
+                "stream=true is required for the SSE transport", parameter="stream"
             )
-        if payload.get("stream", False):
-            raise ApiRequestError("stream=true is not implemented in M8", parameter="stream")
-        if payload.get("n", 1) != 1:
-            raise ApiRequestError("only n=1 is supported", parameter="n")
-        for option in (
-            "temperature",
-            "top_p",
-            "stop",
-            "presence_penalty",
-            "frequency_penalty",
-            "logit_bias",
-            "seed",
-            "tools",
-            "tool_choice",
-            "response_format",
-        ):
-            if option in payload:
-                raise ApiRequestError(
-                    f"{option!r} is not implemented; M8 uses exact greedy generation",
-                    parameter=option,
-                )
-        max_tokens = payload.get("max_tokens", self.config.max_completion_tokens)
-        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 0:
-            raise ApiRequestError(
-                "'max_tokens' must be a non-negative integer", parameter="max_tokens"
-            )
-        if max_tokens > self.config.max_completion_tokens:
-            raise ApiRequestError(
-                f"'max_tokens' exceeds the server limit ({self.config.max_completion_tokens})",
-                parameter="max_tokens",
-            )
-        return model, max_tokens
+        active = self._begin_generation(
+            options=options,
+            endpoint="completion",
+            prompt_builder=lambda _: _Prompt(prompt),
+        )
+        return self._completion_events(active)
 
-    def _normalize_messages(self, messages: Any) -> list[dict[str, str]]:
-        if not isinstance(messages, list) or not messages:
-            raise ApiRequestError("'messages' must be a non-empty array", parameter="messages")
-        normalized: list[dict[str, str]] = []
-        for index, message in enumerate(messages):
-            if not isinstance(message, dict):
-                raise ApiRequestError(
-                    f"messages[{index}] must be an object", parameter="messages"
-                )
-            role = message.get("role")
-            content = message.get("content")
-            if role not in {"system", "user", "assistant"}:
-                raise ApiRequestError(
-                    f"messages[{index}].role is unsupported", parameter="messages"
-                )
-            if not isinstance(content, str):
-                raise ApiRequestError(
-                    f"messages[{index}].content must be a string", parameter="messages"
-                )
-            normalized.append({"role": role, "content": content})
-        return normalized
+    def chat_completion_events(self, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        options = self._options(payload, endpoint="chat_completion")
+        if not options.stream:
+            raise ApiRequestError(
+                "stream=true is required for the SSE transport", parameter="stream"
+            )
+        messages = add_response_format_instruction(
+            normalize_messages(payload.get("messages")), options.response_format
+        )
+        active = self._begin_generation(
+            options=options,
+            endpoint="chat_completion",
+            prompt_builder=lambda engine: self._chat_prompt(messages, engine, options),
+        )
+        return self._chat_events(active)
+
+    def _options(self, payload: dict[str, Any], *, endpoint: Endpoint) -> GenerationOptions:
+        return parse_generation_options(
+            payload,
+            endpoint=endpoint,
+            default_model_id=self.config.model_id,
+            model_exists=self.registry.contains,
+            max_completion_tokens=self.config.max_completion_tokens,
+        )
 
     @staticmethod
-    def _render_chat_prompt(messages: list[dict[str, str]], tokenizer: Any) -> str:
-        apply_template = getattr(tokenizer, "apply_chat_template", None)
-        if callable(apply_template):
-            rendered = apply_template(messages, tokenize=False, add_generation_prompt=True)
-            if isinstance(rendered, str):
-                return rendered
-            raise ApiRequestError("tokenizer chat template did not return text")
-        return "\n".join(f"{message['role']}: {message['content']}" for message in messages)
+    def _chat_prompt(
+        messages: list[dict[str, Any]], engine: StreamingEngine, options: GenerationOptions
+    ) -> _Prompt:
+        rendered, initial_reasoning = render_chat_prompt(
+            messages,
+            engine.tokenizer,
+            tools=options.template_tools,
+            reasoning_effort=options.reasoning_effort,
+        )
+        return _Prompt(rendered, initial_reasoning)
 
-    def _generate(
+    def _begin_generation(
         self,
         *,
-        model_id: str,
-        prompt_builder: Callable[[StreamingEngine], str],
-        max_tokens: int,
+        options: GenerationOptions,
         endpoint: Endpoint,
-    ) -> tuple[str, GenerationMetric]:
+        prompt_builder: Callable[[StreamingEngine], _Prompt],
+    ) -> _ActiveGeneration:
         if not self._generation_slot.acquire(blocking=False):
             self.metrics.reject_busy()
             raise ApiRequestError(
@@ -334,86 +367,248 @@ class LocalGenerationService:
             )
         self.metrics.begin_generation()
         started = time.perf_counter()
-        first_token_at: float | None = None
-        output_parts: list[str] = []
-        completion_tokens = 0
         try:
-            engine = self.registry.activate(model_id)
+            engine = self.registry.activate(options.model_id)
             prompt = prompt_builder(engine)
-            prompt_tokens = _count_tokens(engine.tokenizer, prompt, add_special_tokens=True)
+            prompt_tokens = _count_tokens(engine.tokenizer, prompt.text, add_special_tokens=True)
             if prompt_tokens > self.config.max_prompt_tokens:
                 raise ApiRequestError(
                     f"prompt has {prompt_tokens} tokens; limit is {self.config.max_prompt_tokens}",
                     parameter="prompt",
                 )
-            for response in stream_generate(
-                engine.model,
-                engine.tokenizer,
-                prompt,
-                max_tokens=max_tokens,
-            ):
-                if first_token_at is None:
-                    first_token_at = time.perf_counter()
-                output_parts.append(str(response.text))
-                completion_tokens = int(getattr(response, "generation_tokens", completion_tokens))
-                prompt_tokens = int(getattr(response, "prompt_tokens", prompt_tokens))
-            elapsed = time.perf_counter() - started
-            ttft = first_token_at - started if first_token_at is not None else None
-            stats = engine.runtime.stats()
-            snapshot = engine.memory_manager.snapshot()
-            cache = stats.cache
-            predictive = getattr(stats, "predictive_prefetch", None)
-            io_overlap = getattr(stats, "io_overlap", None)
-            loader = io_overlap.loader if io_overlap is not None else None
-            metric = GenerationMetric(
+            return _ActiveGeneration(
                 request_id=_request_id(endpoint),
-                model_id=model_id,
+                model_id=options.model_id,
                 endpoint=endpoint,
-                elapsed_seconds=elapsed,
-                ttft_seconds=ttft,
+                engine=engine,
+                prompt=prompt,
                 prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                prefill_tokens_per_second=(prompt_tokens / ttft if ttft else 0.0),
-                decode_tokens_per_second=(
-                    max(completion_tokens - 1, 0) / (elapsed - ttft)
-                    if ttft is not None and elapsed > ttft
-                    else 0.0
-                ),
-                disk_bytes=stats.bytes_read,
-                cache_hit_rate=cache.hit_rate if cache is not None else None,
-                resident_bytes=cache.resident_bytes if cache is not None else None,
-                mlx_peak_memory_bytes=snapshot.mlx_peak_memory_bytes,
-                predictive_prefetch_submitted=(predictive.submitted if predictive else None),
-                predictive_prefetch_hits=(loader.predictive_hits if predictive else None),
-                predictive_prefetch_unused=(loader.predictive_unused if predictive else None),
+                options=options,
+                started=started,
             )
         except BaseException:
             self.metrics.fail_generation()
-            raise
-        else:
-            self.metrics.complete_generation(metric)
-            LOGGER.info(
-                "M8 request=%s endpoint=%s ttft=%.3fs prefill_tok_s=%.2f "
-                "decode_tok_s=%.2f cache_hit=%s disk_bytes=%s resident_bytes=%s "
-                "predictive_submitted=%s predictive_hits=%s",
-                metric.request_id,
-                metric.endpoint,
-                metric.ttft_seconds or 0.0,
-                metric.prefill_tokens_per_second,
-                metric.decode_tokens_per_second,
-                metric.cache_hit_rate,
-                metric.disk_bytes,
-                metric.resident_bytes,
-                metric.predictive_prefetch_submitted,
-                metric.predictive_prefetch_hits,
-            )
-            return "".join(output_parts), metric
-        finally:
             self._generation_slot.release()
+            raise
+
+    def _collect_text(self, active: _ActiveGeneration) -> str:
+        return "".join(self._text_fragments(active))
+
+    def _text_fragments(self, active: _ActiveGeneration) -> Iterator[str]:
+        stop_buffer = StopSequenceBuffer(active.options.stop)
+        responses: Any = None
+        try:
+            if active.options.seed is not None:
+                # The server serializes generation, so the process-global MLX RNG
+                # cannot race another request.
+                mx.random.seed(active.options.seed)
+            responses = stream_generate(
+                active.engine.model,
+                active.engine.tokenizer,
+                active.prompt.text,
+                max_tokens=active.options.max_tokens,
+                **self._mlx_generation_kwargs(active.options),
+            )
+            for response in responses:
+                if active.first_token_at is None:
+                    active.first_token_at = time.perf_counter()
+                active.completion_tokens = int(
+                    getattr(response, "generation_tokens", active.completion_tokens)
+                )
+                active.prompt_tokens = int(getattr(response, "prompt_tokens", active.prompt_tokens))
+                emitted = stop_buffer.feed(str(getattr(response, "text", "")))
+                if emitted:
+                    yield emitted
+                if stop_buffer.stopped:
+                    active.stopped = True
+                    break
+            tail = stop_buffer.flush()
+            if tail:
+                yield tail
+        finally:
+            close = getattr(responses, "close", None)
+            if callable(close):
+                close()
+
+    @staticmethod
+    def _mlx_generation_kwargs(options: GenerationOptions) -> dict[str, Any]:
+        processors = make_logits_processors(
+            logit_bias=options.logit_bias,
+            presence_penalty=options.presence_penalty,
+            frequency_penalty=options.frequency_penalty,
+        )
+        kwargs: dict[str, Any] = {
+            "sampler": make_sampler(temp=options.temperature, top_p=options.top_p)
+        }
+        if processors:
+            kwargs["logits_processors"] = processors
+        return kwargs
+
+    def _completion_events(self, active: _ActiveGeneration) -> Iterator[dict[str, Any]]:
+        try:
+            for fragment in self._text_fragments(active):
+                yield _completion_chunk(active, text=fragment)
+        except BaseException:
+            self._fail_generation(active)
+            raise
+        metric = self._complete_generation(active)
+        yield _completion_chunk(active, text="", finish_reason=_finish_reason(active))
+        if active.options.include_usage:
+            yield {
+                "id": active.request_id,
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": active.model_id,
+                "choices": [],
+                "usage": _usage(metric),
+            }
+
+    def _chat_events(self, active: _ActiveGeneration) -> Iterator[dict[str, Any]]:
+        thinking = ThinkingStreamParser(initial_reasoning=active.prompt.initial_reasoning)
+        tool_parser = ToolCallStreamParser(
+            {tool["function"]["name"] for tool in active.options.template_tools}
+        )
+        tool_calls: list[dict[str, Any]] = []
+        try:
+            yield _chat_chunk(active, {"role": "assistant"})
+            for raw_fragment in self._text_fragments(active):
+                for kind, fragment in thinking.feed(raw_fragment):
+                    yield from self._chat_protocol_events(
+                        active, kind, fragment, tool_parser, tool_calls
+                    )
+            for kind, fragment in thinking.flush():
+                yield from self._chat_protocol_events(
+                    active, kind, fragment, tool_parser, tool_calls
+                )
+            for kind, fragment in tool_parser.flush():
+                yield from self._chat_tool_events(active, kind, fragment, tool_calls)
+            enforce_tool_choice(active.options, tool_calls)
+        except BaseException:
+            self._fail_generation(active)
+            raise
+        metric = self._complete_generation(active)
+        yield _chat_chunk(
+            active,
+            {},
+            finish_reason="tool_calls" if tool_calls else _finish_reason(active),
+        )
+        if active.options.include_usage:
+            yield {
+                "id": active.request_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": active.model_id,
+                "choices": [],
+                "usage": _usage(metric),
+            }
+
+    def _chat_protocol_events(
+        self,
+        active: _ActiveGeneration,
+        kind: str,
+        fragment: str,
+        tool_parser: ToolCallStreamParser,
+        tool_calls: list[dict[str, Any]],
+    ) -> Iterator[dict[str, Any]]:
+        if kind == "reasoning_content":
+            if fragment:
+                yield _chat_chunk(active, {"reasoning_content": fragment})
+            return
+        for tool_kind, tool_fragment in tool_parser.feed(fragment):
+            yield from self._chat_tool_events(active, tool_kind, tool_fragment, tool_calls)
+
+    @staticmethod
+    def _chat_tool_events(
+        active: _ActiveGeneration,
+        kind: str,
+        fragment: Any,
+        tool_calls: list[dict[str, Any]],
+    ) -> Iterator[dict[str, Any]]:
+        if kind == "content":
+            if fragment:
+                yield _chat_chunk(active, {"content": fragment})
+            return
+        if kind != "tool_calls":  # pragma: no cover - defensive parser contract
+            raise RuntimeError(f"unexpected tool stream fragment {kind!r}")
+        for call in fragment:
+            index = len(tool_calls)
+            tool_calls.append(call)
+            yield _chat_chunk(
+                active,
+                {
+                    "tool_calls": [
+                        {
+                            "index": index,
+                            "id": call["id"],
+                            "type": "function",
+                            "function": call["function"],
+                        }
+                    ]
+                },
+            )
+
+    def _complete_generation(self, active: _ActiveGeneration) -> GenerationMetric:
+        if active.settled:
+            raise RuntimeError("generation was already settled")
+        active.settled = True
+        elapsed = time.perf_counter() - active.started
+        ttft = active.first_token_at - active.started if active.first_token_at is not None else None
+        stats = active.engine.runtime.stats()
+        snapshot = active.engine.memory_manager.snapshot()
+        cache = getattr(stats, "cache", None)
+        predictive = getattr(stats, "predictive_prefetch", None)
+        io_overlap = getattr(stats, "io_overlap", None)
+        loader = io_overlap.loader if io_overlap is not None else None
+        metric = GenerationMetric(
+            request_id=active.request_id,
+            model_id=active.model_id,
+            endpoint=active.endpoint,
+            elapsed_seconds=elapsed,
+            ttft_seconds=ttft,
+            prompt_tokens=active.prompt_tokens,
+            completion_tokens=active.completion_tokens,
+            prefill_tokens_per_second=(active.prompt_tokens / ttft if ttft else 0.0),
+            decode_tokens_per_second=(
+                max(active.completion_tokens - 1, 0) / (elapsed - ttft)
+                if ttft is not None and elapsed > ttft
+                else 0.0
+            ),
+            disk_bytes=stats.bytes_read,
+            cache_hit_rate=cache.hit_rate if cache is not None else None,
+            resident_bytes=cache.resident_bytes if cache is not None else None,
+            mlx_peak_memory_bytes=snapshot.mlx_peak_memory_bytes,
+            predictive_prefetch_submitted=(predictive.submitted if predictive else None),
+            predictive_prefetch_hits=(loader.predictive_hits if predictive and loader else None),
+            predictive_prefetch_unused=(
+                loader.predictive_unused if predictive and loader else None
+            ),
+        )
+        self.metrics.complete_generation(metric)
+        self._generation_slot.release()
+        LOGGER.info(
+            "M11 request=%s endpoint=%s ttft=%.3fs prefill_tok_s=%.2f "
+            "decode_tok_s=%.2f cache_hit=%s disk_bytes=%s resident_bytes=%s",
+            metric.request_id,
+            metric.endpoint,
+            metric.ttft_seconds or 0.0,
+            metric.prefill_tokens_per_second,
+            metric.decode_tokens_per_second,
+            metric.cache_hit_rate,
+            metric.disk_bytes,
+            metric.resident_bytes,
+        )
+        return metric
+
+    def _fail_generation(self, active: _ActiveGeneration) -> None:
+        if active.settled:
+            return
+        active.settled = True
+        self.metrics.fail_generation()
+        self._generation_slot.release()
 
     def _load_legacy_engine(self, _: Path) -> StreamingEngine:
         if self._legacy_engine is None:
-            raise RuntimeError("the legacy M8 engine has been closed")
+            raise RuntimeError("the legacy engine has been closed")
         return self._legacy_engine
 
 
@@ -450,19 +645,31 @@ class _RequestHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._read_json_body()
+            stream = payload.get("stream") is True
             if path == "/v1/completions":
-                response = self.server.service.completions(payload)
+                response = (
+                    self.server.service.completion_events(payload)
+                    if stream
+                    else self.server.service.completions(payload)
+                )
             else:
-                response = self.server.service.chat_completions(payload)
+                response = (
+                    self.server.service.chat_completion_events(payload)
+                    if stream
+                    else self.server.service.chat_completions(payload)
+                )
         except ApiRequestError as error:
             self._send_error(error.status, str(error), parameter=error.parameter, code=error.code)
         except MemoryPressureError as error:
             self._send_error(HTTPStatus.SERVICE_UNAVAILABLE, str(error), code="memory_pressure")
         except Exception:  # pragma: no cover - defensive boundary for a live server
-            LOGGER.exception("M8 request failed")
+            LOGGER.exception("M11 request setup failed")
             self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "internal server error")
         else:
-            self._send_json(HTTPStatus.OK, response)
+            if stream:
+                self._send_sse(response)
+            else:
+                self._send_json(HTTPStatus.OK, response)
 
     def _read_json_body(self) -> dict[str, Any]:
         content_length = self.headers.get("Content-Length")
@@ -485,6 +692,50 @@ class _RequestHandler(BaseHTTPRequestHandler):
             raise ApiRequestError("request JSON must be an object")
         return payload
 
+    def _send_sse(self, events: Iterator[dict[str, Any]]) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            for event in events:
+                self._send_sse_data(event)
+        except ApiRequestError as error:
+            self._send_sse_data(
+                _error_payload(
+                    error.status, str(error), parameter=error.parameter, code=error.code
+                ),
+                event="error",
+            )
+        except MemoryPressureError as error:
+            self._send_sse_data(
+                _error_payload(HTTPStatus.SERVICE_UNAVAILABLE, str(error), code="memory_pressure"),
+                event="error",
+            )
+        except (BrokenPipeError, ConnectionResetError):
+            LOGGER.info("M11 SSE client disconnected")
+            return
+        except Exception:  # pragma: no cover - defensive live transport boundary
+            LOGGER.exception("M11 SSE request failed")
+            self._send_sse_data(
+                _error_payload(HTTPStatus.INTERNAL_SERVER_ERROR, "internal server error"),
+                event="error",
+            )
+        try:
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            LOGGER.info("M11 SSE client disconnected before [DONE]")
+
+    def _send_sse_data(self, payload: dict[str, Any], *, event: str | None = None) -> None:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if event is not None:
+            self.wfile.write(f"event: {event}\n".encode("ascii"))
+        self.wfile.write(b"data: " + body + b"\n\n")
+        self.wfile.flush()
+
     def _send_error(
         self,
         status: HTTPStatus,
@@ -493,24 +744,10 @@ class _RequestHandler(BaseHTTPRequestHandler):
         parameter: str | None = None,
         code: str | None = None,
     ) -> None:
-        self._send_json(
-            status,
-            {
-                "error": {
-                    "message": message,
-                    "type": (
-                        "invalid_request_error"
-                        if status < HTTPStatus.INTERNAL_SERVER_ERROR
-                        else "server_error"
-                    ),
-                    "param": parameter,
-                    "code": code,
-                }
-            },
-        )
+        self._send_json(status, _error_payload(status, message, parameter=parameter, code=code))
 
     def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -518,11 +755,11 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, format: str, *args: Any) -> None:
-        LOGGER.debug("M8 HTTP %s", format % args)
+        LOGGER.debug("M11 HTTP %s", format % args)
 
 
 def is_loopback_host(host: str) -> bool:
-    """Whether the no-auth M8 server may bind the supplied explicit host."""
+    """Whether the no-auth server may bind the supplied explicit host."""
 
     return host in {"127.0.0.1", "localhost"}
 
@@ -533,17 +770,47 @@ def run_local_server(server: LocalApiServer) -> None:
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        LOGGER.info("M8 server interrupted")
+        LOGGER.info("M11 server interrupted")
     finally:
         server.server_close()
+
+
+def _completion_chunk(
+    active: _ActiveGeneration, *, text: str, finish_reason: str | None = None
+) -> dict[str, Any]:
+    return {
+        "id": active.request_id,
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": active.model_id,
+        "choices": [{"text": text, "index": 0, "logprobs": None, "finish_reason": finish_reason}],
+    }
+
+
+def _chat_chunk(
+    active: _ActiveGeneration, delta: dict[str, Any], finish_reason: str | None = None
+) -> dict[str, Any]:
+    return {
+        "id": active.request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": active.model_id,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
 
 
 def _count_tokens(tokenizer: Any, text: str, *, add_special_tokens: bool) -> int:
     return len(tokenizer.encode(text, add_special_tokens=add_special_tokens))
 
 
-def _finish_reason(completion_tokens: int, max_tokens: int) -> str:
-    return "length" if max_tokens and completion_tokens >= max_tokens else "stop"
+def _finish_reason(active: _ActiveGeneration) -> str:
+    if active.stopped:
+        return "stop"
+    return (
+        "length"
+        if active.options.max_tokens and active.completion_tokens >= active.options.max_tokens
+        else "stop"
+    )
 
 
 def _request_id(endpoint: Endpoint) -> str:
@@ -556,4 +823,23 @@ def _usage(metric: GenerationMetric) -> dict[str, int]:
         "prompt_tokens": metric.prompt_tokens,
         "completion_tokens": metric.completion_tokens,
         "total_tokens": metric.prompt_tokens + metric.completion_tokens,
+    }
+
+
+def _error_payload(
+    status: HTTPStatus,
+    message: str,
+    *,
+    parameter: str | None = None,
+    code: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "error": {
+            "message": message,
+            "type": "invalid_request_error"
+            if status < HTTPStatus.INTERNAL_SERVER_ERROR
+            else "server_error",
+            "param": parameter,
+            "code": code,
+        }
     }
