@@ -5,6 +5,8 @@ import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from email.message import Message
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,6 +19,7 @@ from mlx_moe_stream.server import (
     ModelRegistration,
     ModelRegistry,
     ServerConfig,
+    app,
 )
 from mlx_moe_stream.server.app import ApiRequestError
 
@@ -26,6 +29,57 @@ class _Response:
     text: str
     prompt_tokens: int
     generation_tokens: int
+
+
+class _RemoteImageResponse:
+    def __init__(self, payload: bytes, content_type: str) -> None:
+        self.payload = payload
+        self.headers = Message()
+        self.headers["Content-Type"] = content_type
+
+    def __enter__(self) -> _RemoteImageResponse:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        del args
+
+    def read(self, _: int) -> bytes:
+        return self.payload
+
+
+def test_remote_image_loader_uses_a_user_agent_and_passes_bytes_to_vlm(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request: urllib.request.Request, *, timeout: int):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return _RemoteImageResponse(b"image-bytes", "image/jpeg")
+
+    def fake_load_image(source: BytesIO) -> str:
+        assert isinstance(source, BytesIO)
+        return source.read().decode()
+
+    monkeypatch.setattr(app.urllib.request, "urlopen", fake_urlopen)
+
+    assert app._load_remote_vlm_image(
+        "https://upload.wikimedia.org/image.jpg", fake_load_image
+    ) == ("image-bytes")
+    request = captured["request"]
+    assert request.get_header("User-agent") == app._REMOTE_IMAGE_USER_AGENT
+    assert captured["timeout"] == app._REMOTE_IMAGE_TIMEOUT_SECONDS
+
+
+def test_remote_image_loader_rejects_share_or_viewer_html(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        app.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _RemoteImageResponse(b"<html></html>", "text/html"),
+    )
+
+    with pytest.raises(ValueError, match="direct image URL"):
+        app._load_remote_vlm_image("https://share.google/example", lambda _: object())
 
 
 class _Tokenizer:

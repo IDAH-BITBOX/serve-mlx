@@ -169,9 +169,11 @@ mlx-moe-stream serve \
   --kv-cache auto
 ```
 
-Send an image URL, a `data:` URL, or a local file path in a user message. At
-most four images are accepted per request. Audio and video are intentionally
-not supported.
+Send a **direct image URL** (a URL that returns `image/jpeg`, `image/png`, and
+so on), a `data:` URL, or a local file path in a user message. At most four
+images are accepted per request. A Google share link or an HTML viewer page is
+not an image URL; use the original/download image URL instead. Audio and video
+are intentionally not supported.
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \

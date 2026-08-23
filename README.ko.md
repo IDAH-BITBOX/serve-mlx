@@ -167,8 +167,10 @@ mlx-moe-stream serve \
   --kv-cache auto
 ```
 
-사용자 메시지에서 이미지 URL, `data:` URL, 또는 로컬 파일 경로를 전송할 수
-있습니다. 요청당 최대 네 장이며 오디오와 비디오는 지원하지 않습니다.
+사용자 메시지에서 **이미지 바이트를 직접 반환하는 URL**(`image/jpeg`,
+`image/png` 등), `data:` URL, 또는 로컬 파일 경로를 전송할 수 있습니다. 요청당
+최대 네 장입니다. Google 공유 링크나 HTML 뷰어 페이지는 이미지 URL이 아니므로,
+원본/다운로드 이미지 URL을 사용하세요. 오디오와 비디오는 지원하지 않습니다.
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \

@@ -6,11 +6,13 @@ import json
 import logging
 import threading
 import time
+import urllib.request
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -41,6 +43,10 @@ from .protocol import (
 from .registry import ModelRegistration, ModelRegistry
 
 LOGGER = logging.getLogger(__name__)
+
+_REMOTE_IMAGE_USER_AGENT = "mlx-moe-stream/0.1 (+https://github.com/IDAH-BITBOX/serve-mlx)"
+_REMOTE_IMAGE_TIMEOUT_SECONDS = 15
+_MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -704,7 +710,32 @@ def _load_vlm_image(source: str) -> Any:
         from mlx_vlm.utils import load_image
     except ModuleNotFoundError as error:  # pragma: no cover - loader already guards this
         raise RuntimeError("VLM serving requires `pip install mlx-moe-stream[vlm]`") from error
+    if urlparse(source).scheme in {"http", "https"}:
+        return _load_remote_vlm_image(source, load_image)
     return load_image(source)
+
+
+def _load_remote_vlm_image(source: str, load_image: Callable[[Any], Any]) -> Any:
+    """Fetch a direct image URL with a descriptive User-Agent before decoding.
+
+    Some image CDNs, including Wikimedia, reject Python clients with the
+    default urllib/requests User-Agent.  Passing a decoded byte stream to the
+    MLX-VLM loader keeps local paths and data URIs on its normal path while
+    making direct remote image URLs reliable.
+    """
+
+    request = urllib.request.Request(source, headers={"User-Agent": _REMOTE_IMAGE_USER_AGENT})
+    with urllib.request.urlopen(request, timeout=_REMOTE_IMAGE_TIMEOUT_SECONDS) as response:
+        content_type = response.headers.get_content_type()
+        if not content_type.startswith("image/"):
+            raise ValueError(
+                f"remote image URL returned {content_type!r}, not image data; "
+                "use a direct image URL rather than a share or viewer page"
+            )
+        payload = response.read(_MAX_REMOTE_IMAGE_BYTES + 1)
+    if len(payload) > _MAX_REMOTE_IMAGE_BYTES:
+        raise ValueError(f"remote image exceeds the {_MAX_REMOTE_IMAGE_BYTES // 1024**2} MiB limit")
+    return load_image(BytesIO(payload))
 
 
 class LocalApiServer(ThreadingHTTPServer):
