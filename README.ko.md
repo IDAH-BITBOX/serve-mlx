@@ -58,13 +58,12 @@ prefill 속도와 피크 메모리를 맞바꾸세요.
 ### 256K 컨텍스트 윈도우 실측
 
 같은 M4 환경에서 Qwen3.6으로 실제 OpenAI 호환
-`/v1/chat/completions` 요청을 완료했습니다. **262,141개 prompt 토큰과 1개 생성
-토큰**, 즉 **총 262,142개 토큰**을 처리했습니다(262,144 토큰 경계보다 두 토큰
-작음). `--resident-budget off`, `--kv-cache 4bit`,
-`--prefill-step-size 1024` 구성으로 2시간 16분 28초가 걸렸고, MLX peak allocation은
-12.84GiB였습니다. 이는 256K급 **컨텍스트 윈도우** 검증이지, 256K개의 출력 토큰을
-대화형 속도로 생성한다는 뜻은 아닙니다. SSD-streamed MoE의 전체 윈도우 prefill은
-의도적으로 느린 스트레스 테스트입니다.
+`/v1/chat/completions` 요청을 완료했습니다. **262,143개 prompt 토큰과 1개 생성
+토큰**, 즉 **총 262,144개 토큰**을 처리했습니다. `--resident-budget off`,
+`--kv-cache 4bit`, `--prefill-step-size 1024` 구성으로 2시간 3분 3초가 걸렸고,
+MLX peak allocation은 12.86GiB였습니다. 이는 256K급 **컨텍스트 윈도우** 검증이지,
+256K개의 출력 토큰을 대화형 속도로 생성한다는 뜻은 아닙니다. SSD-streamed MoE의
+전체 윈도우 prefill은 의도적으로 느린 스트레스 테스트입니다.
 
 ### 지속 고부하 사용과 하드웨어 관리 안내
 
@@ -157,8 +156,9 @@ mlx-moe-stream serve \
   --kv-cache auto
 ```
 
-서버 주소는 `http://127.0.0.1:8000`입니다. 첫 요청에서는 non-expert shell을
-올려야 하므로 다음 요청보다 오래 걸릴 수 있습니다.
+서버 주소는 `http://127.0.0.1:8000`이며 `Ctrl-C`를 누를 때까지 계속 실행됩니다.
+요청 하나가 끝나도 모델을 내리거나 서버를 종료하지 않습니다. 첫 요청에서는
+non-expert shell을 올려야 하므로 다음 요청보다 오래 걸릴 수 있습니다.
 
 ### 3. 채팅 요청 보내기
 
@@ -308,7 +308,7 @@ mlx-moe-stream serve \
   --model-id qwen3.6-35b-local \
   --resident-budget off \
   --kv-cache 4bit \
-  --max-prompt-tokens 262144 \
+  --max-prompt-tokens 262143 \
   --max-tokens 1 \
   --prefill-step-size 1024
 ```

@@ -204,6 +204,30 @@ def test_openai_completion_and_chat_shapes_include_usage_and_metrics(
     assert metrics["last_generation"]["resident_bytes"] == 456
 
 
+def test_metrics_failure_after_generation_does_not_block_the_next_request(
+    service: LocalGenerationService, caplog: pytest.LogCaptureFixture
+):
+    assert service._legacy_engine is not None
+
+    def fail_snapshot() -> None:
+        raise RuntimeError("metrics backend unavailable")
+
+    service._legacy_engine.memory_manager.snapshot = fail_snapshot
+    with caplog.at_level("ERROR"):
+        first = service.completions({"model": "test-moe", "prompt": "first"})
+    second = service.completions({"model": "test-moe", "prompt": "second"})
+
+    assert first["choices"][0]["text"] == "hello world"
+    assert second["choices"][0]["text"] == "hello world"
+    metrics = service.metrics.snapshot()
+    assert metrics["completed_total"] == 2
+    assert metrics["failed_total"] == 0
+    assert metrics["active_generations"] == 0
+    assert metrics["last_generation"]["mlx_peak_memory_bytes"] == 0
+    assert metrics["last_generation"]["observability_available"] is False
+    assert "generation metrics collection failed" in caplog.text
+
+
 def test_generation_limits_and_single_active_generation_are_explicit(
     service: LocalGenerationService,
 ):
@@ -530,7 +554,14 @@ def test_http_endpoints_return_openai_json(service: LocalGenerationService):
             {"model": "test-moe", "messages": [{"role": "user", "content": "hello"}]},
         )
         assert response["choices"][0]["message"]["content"] == "hello world"
-        assert _get_json(f"{base_url}/metrics")["completed_total"] == 1
+        # The second request proves that handling a completed request does not
+        # end the HTTP serving loop or leave the serialized slot occupied.
+        second = _post_json(
+            f"{base_url}/v1/completions", {"model": "test-moe", "prompt": "again"}
+        )
+        assert second["choices"][0]["text"] == "hello world"
+        assert _get_json(f"{base_url}/metrics")["completed_total"] == 2
+        assert _get_json(f"{base_url}/health")["active_generations"] == 0
         with pytest.raises(urllib.error.HTTPError) as error:
             _post_json(f"{base_url}/v1/completions", {"model": "wrong", "prompt": "hello"})
         assert error.value.code == 404

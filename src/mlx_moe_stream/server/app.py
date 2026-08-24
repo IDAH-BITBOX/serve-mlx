@@ -90,6 +90,7 @@ class GenerationMetric:
     predictive_prefetch_submitted: int | None
     predictive_prefetch_hits: int | None
     predictive_prefetch_unused: int | None
+    observability_available: bool
 
 
 class ServerMetrics:
@@ -642,38 +643,74 @@ class LocalGenerationService:
         active.settled = True
         elapsed = time.perf_counter() - active.started
         ttft = active.first_token_at - active.started if active.first_token_at is not None else None
-        stats = active.engine.runtime.stats()
-        snapshot = active.engine.memory_manager.snapshot()
-        cache = getattr(stats, "cache", None)
-        predictive = getattr(stats, "predictive_prefetch", None)
-        io_overlap = getattr(stats, "io_overlap", None)
-        loader = io_overlap.loader if io_overlap is not None else None
-        metric = GenerationMetric(
-            request_id=active.request_id,
-            model_id=active.model_id,
-            endpoint=active.endpoint,
-            elapsed_seconds=elapsed,
-            ttft_seconds=ttft,
-            prompt_tokens=active.prompt_tokens,
-            completion_tokens=active.completion_tokens,
-            prefill_tokens_per_second=(active.prompt_tokens / ttft if ttft else 0.0),
-            decode_tokens_per_second=(
-                max(active.completion_tokens - 1, 0) / (elapsed - ttft)
-                if ttft is not None and elapsed > ttft
-                else 0.0
-            ),
-            disk_bytes=stats.bytes_read,
-            cache_hit_rate=cache.hit_rate if cache is not None else None,
-            resident_bytes=cache.resident_bytes if cache is not None else None,
-            mlx_peak_memory_bytes=snapshot.mlx_peak_memory_bytes,
-            predictive_prefetch_submitted=(predictive.submitted if predictive else None),
-            predictive_prefetch_hits=(loader.predictive_hits if predictive and loader else None),
-            predictive_prefetch_unused=(
-                loader.predictive_unused if predictive and loader else None
-            ),
-        )
-        self.metrics.complete_generation(metric)
-        self._generation_slot.release()
+        try:
+            stats = active.engine.runtime.stats()
+            snapshot = active.engine.memory_manager.snapshot()
+            cache = getattr(stats, "cache", None)
+            predictive = getattr(stats, "predictive_prefetch", None)
+            io_overlap = getattr(stats, "io_overlap", None)
+            loader = io_overlap.loader if io_overlap is not None else None
+            metric = GenerationMetric(
+                request_id=active.request_id,
+                model_id=active.model_id,
+                endpoint=active.endpoint,
+                elapsed_seconds=elapsed,
+                ttft_seconds=ttft,
+                prompt_tokens=active.prompt_tokens,
+                completion_tokens=active.completion_tokens,
+                prefill_tokens_per_second=(active.prompt_tokens / ttft if ttft else 0.0),
+                decode_tokens_per_second=(
+                    max(active.completion_tokens - 1, 0) / (elapsed - ttft)
+                    if ttft is not None and elapsed > ttft
+                    else 0.0
+                ),
+                disk_bytes=stats.bytes_read,
+                cache_hit_rate=cache.hit_rate if cache is not None else None,
+                resident_bytes=cache.resident_bytes if cache is not None else None,
+                mlx_peak_memory_bytes=snapshot.mlx_peak_memory_bytes,
+                predictive_prefetch_submitted=(predictive.submitted if predictive else None),
+                predictive_prefetch_hits=(
+                    loader.predictive_hits if predictive and loader else None
+                ),
+                predictive_prefetch_unused=(
+                    loader.predictive_unused if predictive and loader else None
+                ),
+                observability_available=True,
+            )
+        except Exception:
+            # A request has already completed when this runs. Observability is
+            # useful, but a telemetry failure must neither turn that response
+            # into a 500 nor leave the one-generation semaphore acquired.
+            LOGGER.exception("M11 generation metrics collection failed; using fallback metrics")
+            metric = GenerationMetric(
+                request_id=active.request_id,
+                model_id=active.model_id,
+                endpoint=active.endpoint,
+                elapsed_seconds=elapsed,
+                ttft_seconds=ttft,
+                prompt_tokens=active.prompt_tokens,
+                completion_tokens=active.completion_tokens,
+                prefill_tokens_per_second=(active.prompt_tokens / ttft if ttft else 0.0),
+                decode_tokens_per_second=(
+                    max(active.completion_tokens - 1, 0) / (elapsed - ttft)
+                    if ttft is not None and elapsed > ttft
+                    else 0.0
+                ),
+                disk_bytes=0,
+                cache_hit_rate=None,
+                resident_bytes=None,
+                mlx_peak_memory_bytes=0,
+                predictive_prefetch_submitted=None,
+                predictive_prefetch_hits=None,
+                predictive_prefetch_unused=None,
+                observability_available=False,
+            )
+        try:
+            self.metrics.complete_generation(metric)
+        finally:
+            # This is deliberately independent from metrics collection.  A
+            # completed request must always make the next request eligible.
+            self._generation_slot.release()
         LOGGER.info(
             "M11 request=%s endpoint=%s ttft=%.3fs prefill_tok_s=%.2f "
             "decode_tok_s=%.2f cache_hit=%s disk_bytes=%s resident_bytes=%s",

@@ -59,13 +59,12 @@ tight; it trades prefill speed for a lower peak allocation.
 ### 256K context-window run
 
 On that M4 system, Qwen3.6 completed a real OpenAI-compatible
-`/v1/chat/completions` request with **262,141 prompt tokens and one generated
-token** (**262,142 total tokens**, two tokens below the 262,144-token context
-boundary). The run used `--resident-budget off`, `--kv-cache 4bit`, and
-`--prefill-step-size 1024`; it took 2 h 16 m 28 s and reported a 12.84 GiB MLX
-peak allocation. This verifies a 256K-class context window, not an interactive
-256K-token output. Full-window SSD-streamed MoE prefills are intentionally a
-slow stress test.
+`/v1/chat/completions` request with **262,143 prompt tokens and one generated
+token** (**262,144 total tokens**). The run used `--resident-budget off`,
+`--kv-cache 4bit`, and `--prefill-step-size 1024`; it took 2 h 3 m 3 s and
+reported a 12.86 GiB MLX peak allocation. This verifies a 256K-class context
+window, not an interactive 256K-token output. Full-window SSD-streamed MoE
+prefills are intentionally a slow stress test.
 
 ### Sustained-workload and hardware-care notice
 
@@ -164,8 +163,9 @@ mlx-moe-stream serve \
   --kv-cache auto
 ```
 
-The server listens on `http://127.0.0.1:8000`. The first request loads the
-model shell and can take noticeably longer than later requests.
+The server keeps running until you press `Ctrl-C`; completing a request does
+not unload the model or stop the server. The first request loads the model
+shell and can take noticeably longer than later requests.
 
 ### 3. Send a chat request
 
@@ -319,7 +319,7 @@ mlx-moe-stream serve \
   --model-id qwen3.6-35b-local \
   --resident-budget off \
   --kv-cache 4bit \
-  --max-prompt-tokens 262144 \
+  --max-prompt-tokens 262143 \
   --max-tokens 1 \
   --prefill-step-size 1024
 ```
