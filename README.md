@@ -167,6 +167,11 @@ The server keeps running until you press `Ctrl-C`; completing a request does
 not unload the model or stop the server. The first request loads the model
 shell and can take noticeably longer than later requests.
 
+For MLX native-runtime stability, local requests run serially on one
+long-lived server thread. A health or metrics request sent during generation
+waits for that generation to finish; use a separate process if you need
+independent monitoring.
+
 ### 3. Send a chat request
 
 ```bash

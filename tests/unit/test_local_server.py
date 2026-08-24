@@ -539,7 +539,19 @@ def test_m11_json_schema_response_is_checked(
         )
 
 
-def test_http_endpoints_return_openai_json(service: LocalGenerationService):
+def test_http_endpoints_return_openai_json(
+    service: LocalGenerationService, monkeypatch: pytest.MonkeyPatch
+):
+    mlx_call_threads: list[int | None] = []
+
+    def tracking_stream_generate(*_: Any, **__: Any):
+        # MLX work must remain on the one persistent serve_forever thread, not
+        # a new ThreadingHTTPServer handler thread for every request.
+        mlx_call_threads.append(threading.current_thread().ident)
+        yield _Response("hello", 2, 1)
+        yield _Response(" world", 2, 2)
+
+    monkeypatch.setattr("mlx_moe_stream.server.app.stream_generate", tracking_stream_generate)
     server = LocalApiServer("127.0.0.1", 0, service)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
@@ -562,6 +574,7 @@ def test_http_endpoints_return_openai_json(service: LocalGenerationService):
         assert second["choices"][0]["text"] == "hello world"
         assert _get_json(f"{base_url}/metrics")["completed_total"] == 2
         assert _get_json(f"{base_url}/health")["active_generations"] == 0
+        assert mlx_call_threads == [worker.ident, worker.ident]
         with pytest.raises(urllib.error.HTTPError) as error:
             _post_json(f"{base_url}/v1/completions", {"model": "wrong", "prompt": "hello"})
         assert error.value.code == 404

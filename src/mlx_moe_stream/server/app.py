@@ -11,7 +11,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -783,10 +783,16 @@ def _load_remote_vlm_image(source: str, load_image: Callable[[Any], Any]) -> Any
     return load_image(BytesIO(payload))
 
 
-class LocalApiServer(ThreadingHTTPServer):
-    """Threaded HTTP transport; generation itself stays serialized in the service."""
+class LocalApiServer(HTTPServer):
+    """Single long-lived localhost request thread for serialized MLX execution.
 
-    daemon_threads = True
+    MLX maintains native thread-local compilation state.  Keeping HTTP request
+    handling on ``serve_forever``'s persistent thread prevents an MLX call from
+    being made by a short-lived request thread whose thread-local destructors
+    run immediately after one inference.  The service already permits one
+    generation at a time, so serial transport matches its execution contract.
+    """
+
     allow_reuse_address = True
 
     def __init__(self, host: str, port: int, service: LocalGenerationService) -> None:
