@@ -437,9 +437,11 @@ class LocalGenerationService:
                 options=options,
                 started=started,
             )
-        except BaseException:
+        except BaseException as error:
             self.metrics.fail_generation()
             self._generation_slot.release()
+            if _is_mlx_memory_error(error):
+                raise _mlx_memory_pressure_error(active=None) from error
             raise
 
     def _collect_text(self, active: _ActiveGeneration) -> str:
@@ -507,6 +509,10 @@ class LocalGenerationService:
             tail = stop_buffer.flush()
             if tail:
                 yield tail
+        except RuntimeError as error:
+            if _is_mlx_memory_error(error):
+                raise _mlx_memory_pressure_error(active=active) from error
+            raise
         finally:
             close = getattr(responses, "close", None)
             if callable(close):
@@ -781,6 +787,36 @@ def _load_remote_vlm_image(source: str, load_image: Callable[[Any], Any]) -> Any
     if len(payload) > _MAX_REMOTE_IMAGE_BYTES:
         raise ValueError(f"remote image exceeds the {_MAX_REMOTE_IMAGE_BYTES // 1024**2} MiB limit")
     return load_image(BytesIO(payload))
+
+
+def _is_mlx_memory_error(error: BaseException) -> bool:
+    """Recognize MLX/Metal OOM messages that otherwise surface as HTTP 500."""
+
+    message = str(error).lower().replace(" ", "")
+    return any(
+        marker in message
+        for marker in (
+            "insufficientmemory",
+            "outofmemory",
+            "kiogpucommandbuffercallbackerroroutofmemory",
+        )
+    )
+
+
+def _mlx_memory_pressure_error(*, active: _ActiveGeneration | None) -> MemoryPressureError:
+    """Return an actionable API error without exposing an MLX native traceback."""
+
+    message = (
+        "MLX ran out of Unified Memory during generation; reduce the context or prefill "
+        "chunk size, use --kv-cache 4bit, and disable resident experts with "
+        "--resident-budget off"
+    )
+    if active is not None and getattr(active.engine, "processor", None) is not None:
+        message += (
+            ". Vision mode also needs the vision tower in memory; on a 16GB Mac use "
+            "--prefill-step-size 256 and do not assume a 256K context will fit"
+        )
+    return MemoryPressureError(message)
 
 
 class LocalApiServer(HTTPServer):

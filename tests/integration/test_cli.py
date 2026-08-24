@@ -66,6 +66,21 @@ def test_kv_cache_options_parse_for_generate_and_serve():
     assert generate.memory_safety_margin == serve.memory_safety_margin == "auto"
 
 
+def test_vision_serve_defaults_prioritize_unified_memory_headroom():
+    parser = build_parser()
+    vision = parser.parse_args(["serve", "--manifest", "prepared/manifest.json", "--vision"])
+    text = parser.parse_args(["serve", "--manifest", "prepared/manifest.json"])
+
+    assert vision.resident_budget is None
+    assert vision.prefill_step_size is None
+    assert cli._serve_resident_budget(None, vision=True) == (None, False)
+    assert cli._serve_resident_budget(None, vision=False) == (None, True)
+    assert cli._serve_prefill_step_size(None, vision=True) == 256
+    assert cli._serve_prefill_step_size(None, vision=False) == 2_048
+    assert cli._serve_prefill_step_size(512, vision=True) == 512
+    assert text.resident_budget is None
+
+
 def test_serve_rejects_non_loopback_hosts_before_loading_a_model(tmp_path: Path):
     assert main(["serve", "--manifest", str(tmp_path / "missing.json"), "--host", "0.0.0.0"]) == 2
 

@@ -235,6 +235,37 @@ mlx-moe-stream serve \
   --kv-cache auto
 ```
 
+`--vision`에서는 vision tower와 이미지 prefill activation을 위한 여유를 남기기
+위해 기본값이 달라집니다. resident expert cache를 비활성화하고, VLM 임시 작업 공간을
+최소 2GiB 예약하며, prefill step을 256 토큰으로 설정합니다. 값을 직접 덮어쓸 수는
+있지만, 대상 Mac의 `/metrics`를 확인한 뒤에만 늘리세요.
+
+### 16GB Mac의 안전한 VLM 시작 설정
+
+16GB Mac에서 Qwen3.6-35B-A3B 이미지 요청을 보낼 때는 resident cache 없이, 작은
+컨텍스트 윈도우로 시작하세요.
+
+```bash
+mlx-moe-stream serve \
+  --manifest prepared-qwen3.6-35b/manifest.json \
+  --model-id qwen3.6-35b-local \
+  --vision \
+  --resident-budget off \
+  --memory-safety-margin auto \
+  --scratch-reserve 2GiB \
+  --kv-cache 4bit \
+  --max-prompt-tokens 16384 \
+  --max-tokens 128 \
+  --prefill-step-size 256
+```
+
+문서의 256K 텍스트 컨텍스트 스트레스 테스트는 vision 입력을 추가하기 전 24GB Mac에서
+수행했습니다. 16GB Mac에서는 vision tower, 이미지 feature, KV cache, 긴 prefill
+activation이 모두 통합 메모리에 함께 들어가야 하므로 256K VLM 컨텍스트를 보장할 수
+없습니다. MLX가 메모리 부족을 보고하면 이제 모호한 `500` 대신
+`code: "memory_pressure"`인 `503`을 반환합니다. 먼저 `--max-prompt-tokens`를 낮추고,
+그다음 prefill step 크기를 낮추세요.
+
 사용자 메시지에서 **이미지 바이트를 직접 반환하는 URL**(`image/jpeg`,
 `image/png` 등), `data:` URL, 또는 로컬 파일 경로를 전송할 수 있습니다. 요청당
 최대 네 장입니다. Google 공유 링크나 HTML 뷰어 페이지는 이미지 URL이 아니므로,

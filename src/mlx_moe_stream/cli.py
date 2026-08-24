@@ -183,8 +183,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument(
         "--resident-budget",
-        default="auto",
-        help="M4/M7 expert-cache capacity: auto, off, or a byte size (default: auto)",
+        default=None,
+        help=(
+            "M4/M7 expert-cache capacity: auto, off, or a byte size "
+            "(default: auto for text; off with --vision)"
+        ),
     )
     serve.add_argument(
         "--memory-safety-margin",
@@ -200,7 +203,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="minimum M7 reservation for KV cache growth (default: 1GB)",
     )
     _add_kv_cache_options(serve, include_max_context=False)
-    serve.add_argument("--scratch-reserve", default="1GB")
+    serve.add_argument(
+        "--scratch-reserve",
+        default="1GB",
+        help="M7 transient-workspace reservation (VLM uses at least 2GiB)",
+    )
     serve.add_argument("--wired-limit")
     serve.add_argument(
         "--max-prompt-tokens",
@@ -222,10 +229,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--prefill-step-size",
         type=int,
-        default=2_048,
+        default=None,
         help=(
             "tokens per prefill chunk; lower values reduce long-context MoE peak memory "
-            "at the cost of speed (default: 2048)"
+            "at the cost of speed (default: 2048 text; 256 with --vision)"
         ),
     )
     serve.add_argument(
@@ -458,9 +465,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError("M8 has no authentication and only permits a loopback --host")
             if not 1 <= args.port <= 65_535:
                 raise ValueError("--port must be in 1..65535")
-            resident_budget, auto_resident_budget = parse_resident_budget(args.resident_budget)
-            memory_config = _memory_config(args)
+            resident_budget, auto_resident_budget = _serve_resident_budget(
+                args.resident_budget, vision=args.vision
+            )
+            memory_config = _memory_config(
+                args,
+                minimum_scratch_reserve_bytes=(2 * 1024**3 if args.vision else 0),
+            )
             predictor, predictive_config = _predictive_options(args)
+            prefill_step_size = _serve_prefill_step_size(
+                args.prefill_step_size, vision=args.vision
+            )
             kv_cache_config = KvCacheConfig(
                 mode=args.kv_cache,
                 max_context_tokens=args.max_prompt_tokens + args.max_tokens,
@@ -478,7 +493,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_prompt_tokens=args.max_prompt_tokens,
                 max_completion_tokens=args.max_tokens,
                 max_request_bytes=parse_bytes(args.max_request_bytes),
-                prefill_step_size=args.prefill_step_size,
+                prefill_step_size=prefill_step_size,
             )
             registry = ModelRegistry(
                 registrations,
@@ -543,7 +558,9 @@ def _serve_registrations(
     return tuple(ModelRegistration.parse(value) for value in model_specs)
 
 
-def _memory_config(args: argparse.Namespace) -> MemoryBudgetConfig:
+def _memory_config(
+    args: argparse.Namespace, *, minimum_scratch_reserve_bytes: int = 0
+) -> MemoryBudgetConfig:
     """Resolve one CLI memory policy before the model shell is loaded."""
 
     margin = args.memory_safety_margin
@@ -552,12 +569,30 @@ def _memory_config(args: argparse.Namespace) -> MemoryBudgetConfig:
         safety_margin_bytes = automatic_safety_margin_bytes(snapshot.physical_memory_bytes)
     else:
         safety_margin_bytes = parse_bytes(margin)
+    scratch_reserve_bytes = max(parse_bytes(args.scratch_reserve), minimum_scratch_reserve_bytes)
     return MemoryBudgetConfig(
         safety_margin_bytes=safety_margin_bytes,
         kv_reserve_bytes=parse_bytes(args.kv_reserve),
-        scratch_reserve_bytes=parse_bytes(args.scratch_reserve),
+        scratch_reserve_bytes=scratch_reserve_bytes,
         wired_limit_bytes=(parse_bytes(args.wired_limit) if args.wired_limit else None),
     )
+
+
+def _serve_resident_budget(value: str | None, *, vision: bool) -> tuple[int | None, bool]:
+    """Resolve the safe cache default before an optional VLM shell is loaded."""
+
+    if value is None:
+        # A vision tower and projector are permanent Unified Memory residents.
+        # On a 16 GiB Mac, letting auto-cache consume all remaining budget makes
+        # image-prefill activations the most likely source of MLX OOM errors.
+        value = "off" if vision else "auto"
+    return parse_resident_budget(value)
+
+
+def _serve_prefill_step_size(value: int | None, *, vision: bool) -> int:
+    """Keep image-prefill activation peaks bounded unless explicitly overridden."""
+
+    return value if value is not None else (256 if vision else 2_048)
 
 
 def _add_kv_cache_options(parser: argparse.ArgumentParser, *, include_max_context: bool) -> None:

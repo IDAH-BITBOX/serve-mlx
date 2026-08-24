@@ -243,6 +243,38 @@ mlx-moe-stream serve \
   --kv-cache auto
 ```
 
+With `--vision`, the default profile deliberately disables the resident-expert
+cache, reserves at least 2 GiB for transient VLM work, and uses a 256-token
+prefill step. This leaves room for the vision tower and image-prefill
+activations. You can override those values, but do so only after checking
+`/metrics` on the target Mac.
+
+### 16GB Mac: safe VLM starting point
+
+For Qwen3.6-35B-A3B vision requests on a 16GB Mac, begin with a modest context
+window and no resident expert cache:
+
+```bash
+mlx-moe-stream serve \
+  --manifest prepared-qwen3.6-35b/manifest.json \
+  --model-id qwen3.6-35b-local \
+  --vision \
+  --resident-budget off \
+  --memory-safety-margin auto \
+  --scratch-reserve 2GiB \
+  --kv-cache 4bit \
+  --max-prompt-tokens 16384 \
+  --max-tokens 128 \
+  --prefill-step-size 256
+```
+
+The documented 256K text-context stress test ran on a 24GB Mac before adding
+vision inputs. A 16GB Mac cannot be promised a 256K VLM context: the vision
+tower, image features, KV cache, and long-prefill activations must fit in
+Unified Memory together. If MLX reports insufficient memory, the API now
+returns `503` with `code: "memory_pressure"` rather than an opaque `500`;
+lower `--max-prompt-tokens` first, then the prefill step size.
+
 Send a **direct image URL** (a URL that returns `image/jpeg`, `image/png`, and
 so on), a `data:` URL, or a local file path in a user message. At most four
 images are accepted per request. A Google share link or an HTML viewer page is

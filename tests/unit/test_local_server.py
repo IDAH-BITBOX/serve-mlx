@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from mlx_moe_stream.errors import MemoryPressureError
 from mlx_moe_stream.server import (
     LocalApiServer,
     LocalGenerationService,
@@ -247,6 +248,30 @@ def test_generation_limits_and_single_active_generation_are_explicit(
         assert error.value.status == 429
     finally:
         service._generation_slot.release()
+
+
+def test_mlx_out_of_memory_becomes_actionable_memory_pressure(
+    service: LocalGenerationService, monkeypatch: pytest.MonkeyPatch
+):
+    def oom_stream_generate(*_: Any, **__: Any):
+        raise RuntimeError(
+            "[METAL] Command buffer execution failed: "
+            "Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+        )
+        yield  # pragma: no cover - establishes generator type
+
+    monkeypatch.setattr("mlx_moe_stream.server.app.stream_generate", oom_stream_generate)
+    with pytest.raises(MemoryPressureError, match="ran out of Unified Memory"):
+        service.completions({"model": "test-moe", "prompt": "hello"})
+    assert service.metrics.snapshot()["active_generations"] == 0
+
+    def normal_stream_generate(*_: Any, **__: Any):
+        yield _Response("recovered", 1, 1)
+
+    monkeypatch.setattr("mlx_moe_stream.server.app.stream_generate", normal_stream_generate)
+    assert service.completions({"model": "test-moe", "prompt": "retry"})["choices"][0][
+        "text"
+    ] == "recovered"
 
 
 def test_m11_streaming_stop_sequence_and_usage(
@@ -575,6 +600,16 @@ def test_http_endpoints_return_openai_json(
         assert _get_json(f"{base_url}/metrics")["completed_total"] == 2
         assert _get_json(f"{base_url}/health")["active_generations"] == 0
         assert mlx_call_threads == [worker.ident, worker.ident]
+
+        def oom_stream_generate(*_: Any, **__: Any):
+            raise RuntimeError("[METAL] Command buffer execution failed: Insufficient Memory")
+            yield  # pragma: no cover - establishes generator type
+
+        monkeypatch.setattr("mlx_moe_stream.server.app.stream_generate", oom_stream_generate)
+        with pytest.raises(urllib.error.HTTPError) as error:
+            _post_json(f"{base_url}/v1/completions", {"model": "test-moe", "prompt": "oom"})
+        assert error.value.code == 503
+        assert json.loads(error.value.read())["error"]["code"] == "memory_pressure"
         with pytest.raises(urllib.error.HTTPError) as error:
             _post_json(f"{base_url}/v1/completions", {"model": "wrong", "prompt": "hello"})
         assert error.value.code == 404
