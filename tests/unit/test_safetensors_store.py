@@ -111,7 +111,10 @@ def test_manifest_and_pread_match_safetensors_slice_bitwise(tmp_path: Path, spli
         metrics = store.metrics()
 
     assert metrics.bytes_read == bundle.total_bytes
-    assert metrics.read_count == 9
+    # One pread per contiguous run: the leading-axis layout scatters an expert's
+    # nine spans, while the split layout stores them back to back.
+    assert metrics.read_count == (2 if split else 9)
+    assert metrics.read_count <= len(bundle.tensors)
     with safe_open(model_path / "model.safetensors", framework="np") as source:
         for tensor in bundle.tensors:
             if split:

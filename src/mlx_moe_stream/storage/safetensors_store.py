@@ -191,10 +191,9 @@ class SafetensorsExpertStore:
         with self._lock:
             return StorageReadMetrics(bytes_read=self._bytes_read, read_count=self._read_count)
 
-    def read_tensor(self, tensor: TensorSpan) -> bytes:
-        if tensor.offset < 0 or tensor.nbytes <= 0:
-            raise StorageReadError(f"invalid requested span {tensor.tensor_name!r}")
-        path = tensor.file.resolve()
+    def _pread(self, path: Path, offset: int, nbytes: int, label: str) -> bytes:
+        """One exact ``os.pread`` of a byte range, counted as a single device read."""
+
         try:
             with self._lock:
                 descriptor = self._descriptors.get(path)
@@ -202,34 +201,82 @@ class SafetensorsExpertStore:
                     descriptor = os.open(path, os.O_RDONLY)
                     self._descriptors[path] = descriptor
                 file_size = os.fstat(descriptor).st_size
-            if tensor.offset + tensor.nbytes > file_size:
+            if offset + nbytes > file_size:
                 raise StorageReadError(
-                    f"requested range exceeds source file: {path}:{tensor.offset}+{tensor.nbytes}"
+                    f"requested range exceeds source file: {path}:{offset}+{nbytes}"
                 )
-            data = os.pread(descriptor, tensor.nbytes, tensor.offset)
+            data = os.pread(descriptor, nbytes, offset)
         except StorageReadError:
             raise
         except OSError as error:
             raise StorageReadError(f"failed to pread {path}") from error
-        if len(data) != tensor.nbytes:
+        if len(data) != nbytes:
             raise StorageReadError(
-                f"short read for {tensor.tensor_name!r}: expected {tensor.nbytes}, got {len(data)}"
+                f"short read for {label!r}: expected {nbytes}, got {len(data)}"
             )
         with self._lock:
             self._bytes_read += len(data)
             self._read_count += 1
         return data
 
-    def read_bundle(self, bundle: ExpertBundleSpec) -> dict[str, bytes]:
-        tensors: dict[str, bytes] = {}
+    def read_tensor(self, tensor: TensorSpan) -> bytes:
+        if tensor.offset < 0 or tensor.nbytes <= 0:
+            raise StorageReadError(f"invalid requested span {tensor.tensor_name!r}")
+        return self._pread(
+            tensor.file.resolve(), tensor.offset, tensor.nbytes, tensor.tensor_name
+        )
+
+    def read_bundle(self, bundle: ExpertBundleSpec) -> dict[str, Any]:
+        """Read one expert, merging physically adjacent spans into single preads.
+
+        A bundle-major layout stores all of an expert's spans back to back, so the
+        whole expert costs one device read. Scattered layouts fall back to one read
+        per span, matching the pre-coalescing behaviour exactly.
+        """
+
+        by_file: dict[Path, list[TensorSpan]] = {}
+        seen_roles: set[str] = set()
         for tensor in bundle.tensors:
-            if tensor.role in tensors:
+            if tensor.role in seen_roles:
                 message = f"duplicate tensor role in bundle {bundle.key}: {tensor.role}"
                 raise StorageReadError(message)
-            tensors[tensor.role] = self.read_tensor(tensor)
+            seen_roles.add(tensor.role)
+            if tensor.offset < 0 or tensor.nbytes <= 0:
+                raise StorageReadError(f"invalid requested span {tensor.tensor_name!r}")
+            by_file.setdefault(tensor.file.resolve(), []).append(tensor)
+
+        tensors: dict[str, Any] = {}
+        for path, spans in by_file.items():
+            spans.sort(key=lambda span: span.offset)
+            run: list[TensorSpan] = []
+            for span in spans:
+                if run and span.offset == run[-1].offset + run[-1].nbytes:
+                    run.append(span)
+                    continue
+                self._read_run(path, run, tensors)
+                run = [span]
+            self._read_run(path, run, tensors)
+
         if sum(len(value) for value in tensors.values()) != bundle.total_bytes:
             raise StorageReadError(f"incorrect read length for expert bundle {bundle.key}")
         return tensors
+
+    def _read_run(self, path: Path, run: list[TensorSpan], out: dict[str, Any]) -> None:
+        """Issue one pread for a contiguous run and hand back zero-copy views."""
+
+        if not run:
+            return
+        if len(run) == 1:
+            span = run[0]
+            out[span.role] = self._pread(path, span.offset, span.nbytes, span.tensor_name)
+            return
+        start = run[0].offset
+        total = run[-1].offset + run[-1].nbytes - start
+        label = f"{run[0].tensor_name}+{len(run) - 1} adjacent"
+        blob = memoryview(self._pread(path, start, total, label))
+        for span in run:
+            begin = span.offset - start
+            out[span.role] = blob[begin : begin + span.nbytes]
 
 
 def resolve_model_path(model: str | Path) -> Path:
