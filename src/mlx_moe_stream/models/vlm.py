@@ -7,11 +7,12 @@ from typing import Any
 
 import mlx.nn as nn
 
-from ..kv_cache import KvCacheConfig, make_memory_manager
+from ..kv_cache import KvCacheConfig
 from ..manifest import ModelManifest
 from ..memory import MemoryBudgetConfig
 from ..prefetch import PredictivePrefetchConfig, TransitionPredictor
 from ..runtime import PREFILL_ORDERS, CachedExpertRuntime, NoCacheExpertRuntime, PrefillOrder
+from ..startup import prepare_streaming_runtime
 from ..storage import load_nonexpert_weights
 from .gemma4 import StreamingGemmaExperts
 from .qwen3_5_moe import StreamingQwen35VlmMoeBlock
@@ -32,6 +33,9 @@ def load_vlm_streaming(
     io_workers: int = 0,
     prefetch_depth: int = 1,
     async_gpu: bool = False,
+    startup_io_probe: str | float = "auto",
+    warmup: str = "auto",
+    warmup_timeout_seconds: float = 300.0,
 ) -> StreamingEngine:
     """Load a VLM shell while leaving every routed expert bundle on SSD.
 
@@ -81,38 +85,31 @@ def load_vlm_streaming(
         mx.eval(model.parameters())
 
         shell_bytes = int(mx.get_active_memory())
-        memory_manager, kv_cache = make_memory_manager(
-            memory_config,
-            kv_cache_config,
-            model_config=source_config,
-            shell_bytes=shell_bytes,
-        )
-        memory_budget = memory_manager.plan(
-            shell_bytes=shell_bytes,
-            requested_expert_budget_bytes=resident_budget_bytes,
-            auto_enabled=auto_resident_budget,
-            minimum_expert_bytes=max(
-                bundle.total_bytes for bundle in manifest.expert_bundles.values()
-            ),
-        )
-        runtime_options = {
+        runtime_options: dict[str, Any] = {
             "io_workers": io_workers,
             "prefetch_depth": prefetch_depth,
             "async_gpu": async_gpu,
-            "memory_manager": memory_manager,
             "predictor": predictor,
             "predictive_config": predictive_config,
+            "expert_activation": "swiglu" if manifest.model_type == "qwen3_5_moe" else "geglu",
         }
-        if manifest.model_type == "qwen3_5_moe":
-            runtime_options["expert_activation"] = "swiglu"
-        else:
-            runtime_options["expert_activation"] = "geglu"
-        if memory_budget.expert_budget_bytes is None:
-            runtime = NoCacheExpertRuntime(manifest, **runtime_options)
-        else:
-            runtime = CachedExpertRuntime(
-                manifest, capacity_bytes=memory_budget.expert_budget_bytes, **runtime_options
-            )
+        startup = prepare_streaming_runtime(
+            manifest,
+            shell_bytes=shell_bytes,
+            model_config=source_config,
+            resident_budget_bytes=resident_budget_bytes,
+            auto_resident_budget=auto_resident_budget,
+            memory_config=memory_config,
+            kv_cache_config=kv_cache_config,
+            runtime_options=runtime_options,
+            startup_io_probe=startup_io_probe,
+            warmup=warmup,
+            warmup_timeout_seconds=warmup_timeout_seconds,
+        )
+        memory_manager = startup.memory_manager
+        kv_cache = startup.kv_cache
+        memory_budget = startup.memory_budget
+        runtime = startup.runtime
         replaced = _replace_vlm_moe_blocks(
             model,
             manifest,
@@ -135,6 +132,7 @@ def load_vlm_streaming(
         memory_budget=memory_budget,
         processor=processor,
         kv_cache=kv_cache,
+        startup_decision=startup.decision,
     )
 
 

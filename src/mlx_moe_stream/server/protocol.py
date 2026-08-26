@@ -168,7 +168,7 @@ def normalize_messages(messages: Any) -> list[Message]:
             content = ""
         if isinstance(content, list):
             content = _normalize_content_parts(content, index=index, role=role)
-        if not isinstance(content, (str, list)):
+        if not isinstance(content, str | list):
             raise ApiRequestError(
                 f"messages[{index}].content must be a string or content-part array",
                 parameter="messages",
@@ -612,7 +612,7 @@ def _number(
     payload: dict[str, Any], name: str, *, default: float, minimum: float, maximum: float
 ) -> float:
     value = payload.get(name, default)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
         raise ApiRequestError(f"'{name}' must be a finite number", parameter=name)
     number = float(value)
     if not minimum <= number <= maximum:
@@ -666,7 +666,7 @@ def _parse_logit_bias(value: Any) -> dict[int, float] | None:
             raise ApiRequestError(
                 "logit_bias keys must be token IDs", parameter="logit_bias"
             ) from error
-        if parsed_id < 0 or isinstance(bias, bool) or not isinstance(bias, (int, float)):
+        if parsed_id < 0 or isinstance(bias, bool) or not isinstance(bias, int | float):
             raise ApiRequestError("logit_bias values must be numbers", parameter="logit_bias")
         parsed_bias = float(bias)
         if not math.isfinite(parsed_bias) or not -100 <= parsed_bias <= 100:

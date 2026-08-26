@@ -192,9 +192,7 @@ class _GenerationStream:
     the generation, started or not.
     """
 
-    def __init__(
-        self, events: Iterator[dict[str, Any]], abandon: Callable[[], None]
-    ) -> None:
+    def __init__(self, events: Iterator[dict[str, Any]], abandon: Callable[[], None]) -> None:
         self._events = events
         self._abandon: Callable[[], None] | None = abandon
         self._started = False
@@ -286,6 +284,8 @@ class LocalGenerationService:
         snapshot["kv_cache"] = kv_cache.to_dict() if kv_cache is not None else None
         memory_budget = getattr(engine, "memory_budget", None) if engine is not None else None
         snapshot["memory_budget"] = memory_budget.to_dict() if memory_budget is not None else None
+        startup_decision = getattr(engine, "startup_decision", None) if engine is not None else None
+        snapshot["startup"] = startup_decision.report if startup_decision is not None else None
         return snapshot
 
     def completions(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -404,9 +404,7 @@ class LocalGenerationService:
             endpoint="chat_completion",
             prompt_builder=lambda engine: self._chat_prompt(messages, engine, options),
         )
-        return _GenerationStream(
-            self._chat_events(active), lambda: self._fail_generation(active)
-        )
+        return _GenerationStream(self._chat_events(active), lambda: self._fail_generation(active))
 
     def _options(self, payload: dict[str, Any], *, endpoint: Endpoint) -> GenerationOptions:
         return parse_generation_options(
@@ -577,8 +575,7 @@ class LocalGenerationService:
                 close()
 
     def _mlx_generation_kwargs(
-        self,
-        options: GenerationOptions, engine: StreamingEngine | None = None
+        self, options: GenerationOptions, engine: StreamingEngine | None = None
     ) -> dict[str, Any]:
         processors = make_logits_processors(
             logit_bias=options.logit_bias,
@@ -1053,7 +1050,13 @@ class _RequestHandler(BaseHTTPRequestHandler):
             LOGGER.info("M11 SSE client disconnected before the error was delivered")
 
     def _send_sse_data(self, payload: dict[str, Any], *, event: str | None = None) -> None:
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        # allow_nan=False: a non-finite float (inf/-inf/nan) is not valid
+        # JSON and every consumer (JS JSON.parse, Go encoding/json, serde)
+        # rejects it outright; fail loudly here instead of shipping wire
+        # garbage.
+        body = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
         if event is not None:
             self.wfile.write(f"event: {event}\n".encode("ascii"))
         self.wfile.write(b"data: " + body + b"\n\n")
@@ -1070,7 +1073,13 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self._send_json(status, _error_payload(status, message, parameter=parameter, code=code))
 
     def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        # allow_nan=False: see _send_sse_data. /metrics is the concrete case
+        # this guards -- an M13 full_residency startup decision's
+        # decode_ceiling_tps used to reach here as inf before advisor.py
+        # clamped it to None; this is the belt to that suspender.
+        body = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
