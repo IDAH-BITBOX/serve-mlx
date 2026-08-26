@@ -12,7 +12,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-
 from mlx_moe_stream.errors import MemoryPressureError
 from mlx_moe_stream.server import (
     LocalApiServer,

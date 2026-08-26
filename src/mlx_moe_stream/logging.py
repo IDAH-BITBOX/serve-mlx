@@ -28,8 +28,7 @@ def configure_logging(
 
     logger = logging.getLogger("mlx_moe_stream")
     if not any(
-        isinstance(handler, logging.StreamHandler)
-        and not isinstance(handler, logging.FileHandler)
+        isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
         for handler in logger.handlers
     ):
         stream_handler = logging.StreamHandler()
@@ -48,4 +47,3 @@ def configure_logging(
         logger.addHandler(file_handler)
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     return logger
-

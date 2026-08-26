@@ -132,9 +132,7 @@ class SafeTensorHeader:
                     f"tensor size mismatch for {name!r} in {path}: "
                     f"expected {expected_nbytes}, got {end - start}"
                 )
-                raise StorageReadError(
-                    message
-                )
+                raise StorageReadError(message)
             if data_start + end > file_size:
                 raise StorageReadError(f"tensor range exceeds file for {name!r} in {path}")
             tensors[name] = SafeTensorInfo(
@@ -211,9 +209,7 @@ class SafetensorsExpertStore:
         except OSError as error:
             raise StorageReadError(f"failed to pread {path}") from error
         if len(data) != nbytes:
-            raise StorageReadError(
-                f"short read for {label!r}: expected {nbytes}, got {len(data)}"
-            )
+            raise StorageReadError(f"short read for {label!r}: expected {nbytes}, got {len(data)}")
         with self._lock:
             self._bytes_read += len(data)
             self._read_count += 1
@@ -222,9 +218,7 @@ class SafetensorsExpertStore:
     def read_tensor(self, tensor: TensorSpan) -> bytes:
         if tensor.offset < 0 or tensor.nbytes <= 0:
             raise StorageReadError(f"invalid requested span {tensor.tensor_name!r}")
-        return self._pread(
-            tensor.file.resolve(), tensor.offset, tensor.nbytes, tensor.tensor_name
-        )
+        return self._pread(tensor.file.resolve(), tensor.offset, tensor.nbytes, tensor.tensor_name)
 
     def read_bundle(self, bundle: ExpertBundleSpec) -> dict[str, Any]:
         """Read one expert, merging physically adjacent spans into single preads.
@@ -336,9 +330,7 @@ def build_streaming_manifest(model: str | Path) -> ModelManifest:
     locations, shard_files = _tensor_locations(model_path)
     bundles: dict[ExpertKey, ExpertBundleSpec] = {}
     for layer in range(num_layers):
-        bundles.update(
-            _build_layer_bundles(layer, num_experts, locations, quantization, layout)
-        )
+        bundles.update(_build_layer_bundles(layer, num_experts, locations, quantization, layout))
     manifest = ModelManifest(
         format_version=1,
         model_type=model_type,

@@ -381,9 +381,7 @@ def summarize_trace(
         }
 
     accesses = [
-        ExpertKey(event.layer_id, expert)
-        for event in ordered_events
-        for expert in event.expert_ids
+        ExpertKey(event.layer_id, expert) for event in ordered_events for expert in event.expert_ids
     ]
     cache_curve = simulate_lru_curve(accesses, capacities)
     return {
@@ -440,15 +438,15 @@ def _is_supported_qwen3_moe_block(block: Any) -> bool:
 def _rows_from_array_like(value: Any) -> list[list[Any]]:
     if hasattr(value, "tolist"):
         value = value.tolist()
-    if not isinstance(value, (list, tuple)):
+    if not isinstance(value, list | tuple):
         raise TraceProtocolError("router result must be an array or nested sequence")
 
     rows: list[list[Any]] = []
 
     def visit(item: Any) -> None:
-        if not isinstance(item, (list, tuple)):
+        if not isinstance(item, list | tuple):
             raise TraceProtocolError("router result does not have a top-k axis")
-        if item and all(not isinstance(value, (list, tuple)) for value in item):
+        if item and all(not isinstance(value, list | tuple) for value in item):
             rows.append(list(item))
             return
         for child in item:
