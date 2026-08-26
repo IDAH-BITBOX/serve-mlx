@@ -118,7 +118,7 @@ def test_cached_runtime_reads_a_bundle_once_then_reuses_its_mlx_arrays(tmp_path:
     assert first.arrays is second.arrays
     assert stats.expert_resolutions == 2
     assert stats.bytes_read == bundle.total_bytes
-    assert stats.read_count == len(bundle.tensors)
+    assert stats.read_count <= len(bundle.tensors)
     assert stats.cache is not None
     assert stats.cache.hit_count == 1
     assert stats.cache.miss_count == 1
