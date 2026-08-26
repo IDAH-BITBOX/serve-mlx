@@ -443,6 +443,26 @@ def test_metrics_include_the_active_memory_budget(service: LocalGenerationServic
     assert service.metrics_snapshot()["memory_budget"] == {"expert_budget_bytes": 2}
 
 
+def test_metrics_include_the_m13_startup_decision_report(service: LocalGenerationService):
+    assert service._legacy_engine is not None
+    service._legacy_engine.startup_decision = SimpleNamespace(
+        report={"mode": "full_residency", "resident_fraction": 1.0}
+    )
+    service.completions({"model": "test-moe", "prompt": "hello"})
+
+    assert service.metrics_snapshot()["startup"] == {
+        "mode": "full_residency",
+        "resident_fraction": 1.0,
+    }
+
+
+def test_metrics_startup_is_none_without_a_startup_decision(service: LocalGenerationService):
+    assert service._legacy_engine is not None
+    service.completions({"model": "test-moe", "prompt": "hello"})
+
+    assert service.metrics_snapshot()["startup"] is None
+
+
 def test_m11_thinking_and_qwen_tool_calls(
     service: LocalGenerationService, monkeypatch: pytest.MonkeyPatch
 ):

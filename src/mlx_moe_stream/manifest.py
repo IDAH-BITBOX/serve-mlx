@@ -98,6 +98,21 @@ class ExpertBundleSpec:
 
 
 @dataclass(frozen=True)
+class ExpertWorkingSet:
+    """Aggregate expert-bundle byte totals used to size the M7 memory budget."""
+
+    total_bytes: int
+    bundle_count: int
+    mean_bundle_bytes: float
+    min_bundle_bytes: int
+    max_bundle_bytes: int
+    per_token_full_miss_bytes: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class ModelManifest:
     """Portable JSON description of a prepared source model's expert bytes."""
 
@@ -151,6 +166,29 @@ class ModelManifest:
                             raise ValueError(
                                 f"tensor span exceeds source file: {range_description}"
                             )
+
+    def expert_working_set(self) -> ExpertWorkingSet:
+        """Summarize routed-expert byte totals already present in this manifest.
+
+        Pure arithmetic over ``self.expert_bundles``: no file I/O, since the
+        manifest is already loaded and validated by the time a caller wants
+        this for M7 memory-budget sizing.
+        """
+
+        if not self.expert_bundles:
+            raise ValueError("manifest has no expert bundles to summarize")
+        bundle_bytes = [bundle.total_bytes for bundle in self.expert_bundles.values()]
+        bundle_count = len(bundle_bytes)
+        total_bytes = sum(bundle_bytes)
+        mean_bundle_bytes = total_bytes / bundle_count
+        return ExpertWorkingSet(
+            total_bytes=total_bytes,
+            bundle_count=bundle_count,
+            mean_bundle_bytes=mean_bundle_bytes,
+            min_bundle_bytes=min(bundle_bytes),
+            max_bundle_bytes=max(bundle_bytes),
+            per_token_full_miss_bytes=self.num_layers * self.experts_per_token * mean_bundle_bytes,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {

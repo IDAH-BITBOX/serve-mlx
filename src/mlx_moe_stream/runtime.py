@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -20,10 +23,10 @@ from .prefetch import (
 )
 from .storage import SafetensorsExpertStore, materialize_mlx_array
 
+_logger = logging.getLogger(__name__)
+
 PrefillOrder = Literal["expert_id", "resident_first", "disk_offset"]
-PREFILL_ORDERS: frozenset[str] = frozenset(
-    {"expert_id", "resident_first", "disk_offset"}
-)
+PREFILL_ORDERS: frozenset[str] = frozenset({"expert_id", "resident_first", "disk_offset"})
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,29 @@ class IoOverlapStats:
 
 
 @dataclass(frozen=True)
+class WarmupStats:
+    """M13 result of preloading resident experts directly into the cache.
+
+    Populated only by :meth:`CachedExpertRuntime.warmup`; a no-cache runtime
+    never has one. ``stop_reason`` records why the loop stopped iterating:
+    ``"completed"`` (every requested key was considered), ``"capacity"``
+    (the next bundle would exceed the cache's byte budget -- no eviction is
+    performed), ``"deadline"`` (the wall-clock ``deadline`` passed),
+    ``"memory_ceiling"`` (``mx.get_active_memory()`` exceeded
+    ``active_memory_ceiling`` after a batch), or ``"error"`` (an unexpected
+    exception outside the per-bundle reader/materialize try block; warmup
+    never lets this fail engine startup).
+    """
+
+    requested: int
+    admitted: int
+    bytes_admitted: int
+    reader_errors: int
+    elapsed_seconds: float
+    stop_reason: Literal["completed", "capacity", "deadline", "memory_ceiling", "error"]
+
+
+@dataclass(frozen=True)
 class RuntimeStats:
     expert_resolutions: int
     bytes_read: int
@@ -57,6 +83,7 @@ class RuntimeStats:
     io_overlap: IoOverlapStats | None = None
     memory_events: tuple[MemoryPressureEvent, ...] = ()
     predictive_prefetch: PredictivePrefetchStats | None = None
+    warmup: WarmupStats | None = None
 
 
 class NoCacheExpertRuntime:
@@ -164,9 +191,7 @@ class NoCacheExpertRuntime:
             PrefillLayerStats(layer, token_count, route_count, unique_experts, order)
         )
 
-    def order_experts(
-        self, layer: int, experts: list[int], order: PrefillOrder
-    ) -> list[int]:
+    def order_experts(self, layer: int, experts: list[int], order: PrefillOrder) -> list[int]:
         return _order_experts(self.manifest, layer, experts, order)
 
     @property
@@ -190,6 +215,24 @@ class NoCacheExpertRuntime:
 
     def route_history(self) -> tuple[tuple[int, tuple[int, ...]], ...]:
         return tuple(self._route_history)
+
+    def warmup(
+        self,
+        keys: Sequence[ExpertKey],
+        *,
+        deadline: float | None = None,
+        active_memory_ceiling: int | None = None,
+    ) -> None:
+        """No-op: this runtime has no resident cache to preload.
+
+        Kept symmetric with :meth:`CachedExpertRuntime.warmup` so startup
+        code can call ``runtime.warmup(...)`` unconditionally without an
+        ``isinstance`` check.
+        """
+
+        del keys, deadline, active_memory_ceiling
+        _logger.info("M13 startup warmup skipped: expert cache is disabled (no-cache runtime)")
+        return None
 
     def stats(self) -> RuntimeStats:
         metrics = self.store.metrics()
@@ -299,6 +342,7 @@ class CachedExpertRuntime:
         self._route_history: list[tuple[int, tuple[int, ...]]] = []
         self._prefill_layers: list[PrefillLayerStats] = []
         self._batch_pins: list[ExpertKey] = []
+        self._warmup_stats: WarmupStats | None = None
 
     def close(self) -> None:
         self.abort_batch()
@@ -389,9 +433,7 @@ class CachedExpertRuntime:
             PrefillLayerStats(layer, token_count, route_count, unique_experts, order)
         )
 
-    def order_experts(
-        self, layer: int, experts: list[int], order: PrefillOrder
-    ) -> list[int]:
+    def order_experts(self, layer: int, experts: list[int], order: PrefillOrder) -> list[int]:
         return _order_experts(self.manifest, layer, experts, order, self.cache)
 
     @property
@@ -429,7 +471,142 @@ class CachedExpertRuntime:
             io_overlap=self._io_stats(),
             memory_events=(self._memory_manager.events() if self._memory_manager else ()),
             predictive_prefetch=(self._predictive.stats() if self._predictive else None),
+            warmup=self._warmup_stats,
         )
+
+    def warmup(
+        self,
+        keys: Sequence[ExpertKey],
+        *,
+        deadline: float | None = None,
+        active_memory_ceiling: int | None = None,
+    ) -> WarmupStats:
+        """M13: preload ``keys`` directly into the resident cache before serving.
+
+        This is an expert-cache preload, not a model forward pass: it calls
+        the same ``_read_bundle`` -> ``_materialize`` -> ``cache.admit`` path
+        ``_resolve_resident`` uses on a miss, but deliberately bypasses
+        ``cache.get()`` and never increments ``_expert_resolutions`` --
+        touching either would corrupt the hit/miss counters and resolution
+        count that the M11 investigation's cache-hit-rate numbers depend on
+        being exact.
+
+        Rules enforced here:
+
+        1. ``keys`` are read in ascending ``(file, offset)`` order so a cold
+           SSD sees a mostly-sequential scan instead of random access.
+        2. Only ``_read_bundle``/``_materialize``/``cache.admit`` touch the
+           cache; hit/miss/``_expert_resolutions`` counters are untouched.
+        3. The loop stops **before** admitting a bundle that would push
+           resident bytes over ``cache.capacity_bytes`` -- it never evicts to
+           make room.
+        4. Every admitted bundle is forced to materialize with ``mx.eval()``;
+           if ``active_memory_ceiling`` is given and ``mx.get_active_memory()``
+           exceeds it after that eval, warmup stops immediately.
+        5. When an I/O loader is configured, reads are pipelined ``prefetch()``
+           ``prefetch_depth`` keys ahead of the key currently being
+           ``demand()``-ed (via ``_read_bundle``), matching the normal decode
+           path's overlap.
+        6. Progress is logged roughly every 10% of ``requested`` keys.
+        7. No exception here -- from sorting, a single bundle's read, or the
+           memory probe -- is allowed to escape and fail engine startup; any
+           unexpected failure is caught, logged as a warning, and warmup
+           returns whatever partial progress it made.
+        """
+
+        start = time.monotonic()
+        requested = len(keys)
+        admitted = 0
+        bytes_admitted = 0
+        reader_errors = 0
+        stop_reason: Literal["completed", "capacity", "deadline", "memory_ceiling", "error"] = (
+            "completed"
+        )
+        try:
+            ordered = self._warmup_order(keys)
+            depth = self._prefetch_depth if self._loader is not None else 0
+            if self._loader is not None and depth > 0:
+                for key in ordered[:depth]:
+                    bundle = self.manifest.expert_bundles.get(key)
+                    if bundle is not None:
+                        self._loader.prefetch(key, bundle, origin="prefetch")
+            checkpoint = max(1, requested // 10)
+            for index, key in enumerate(ordered):
+                if deadline is not None and time.monotonic() >= deadline:
+                    stop_reason = "deadline"
+                    break
+                bundle = self.manifest.expert_bundles.get(key)
+                if bundle is None or self.cache.contains(key):
+                    continue
+                resident_bytes = self.cache.stats().resident_bytes
+                if resident_bytes + bundle.total_bytes > self.cache.capacity_bytes:
+                    stop_reason = "capacity"
+                    break
+                if self._loader is not None and depth > 0:
+                    next_index = index + depth
+                    if next_index < len(ordered):
+                        next_key = ordered[next_index]
+                        next_bundle = self.manifest.expert_bundles.get(next_key)
+                        if next_bundle is not None:
+                            self._loader.prefetch(next_key, next_bundle, origin="prefetch")
+                try:
+                    raw_tensors = self._read_bundle(key, bundle)
+                    arrays = self._materialize(key, bundle, raw_tensors)
+                    self._mx().eval(list(arrays.values()))
+                except Exception:
+                    reader_errors += 1
+                    _logger.warning(
+                        "M13 startup warmup could not load expert %s; skipping", key, exc_info=True
+                    )
+                    continue
+                if active_memory_ceiling is not None:
+                    try:
+                        active = int(self._mx().get_active_memory())
+                    except Exception:
+                        active = None
+                    if active is not None and active > active_memory_ceiling:
+                        stop_reason = "memory_ceiling"
+                        break
+                self.cache.admit(
+                    ResidentExpert(
+                        key=key, arrays=arrays, nbytes=bundle.total_bytes, last_used_step=0
+                    )
+                )
+                admitted += 1
+                bytes_admitted += bundle.total_bytes
+                if (index + 1) % checkpoint == 0:
+                    _logger.info(
+                        "M13 startup warmup progress: %d/%d experts considered, %d admitted",
+                        index + 1,
+                        requested,
+                        admitted,
+                    )
+        except Exception:
+            stop_reason = "error"
+            _logger.warning(
+                "M13 startup warmup failed unexpectedly; continuing without full warmup",
+                exc_info=True,
+            )
+        stats = WarmupStats(
+            requested=requested,
+            admitted=admitted,
+            bytes_admitted=bytes_admitted,
+            reader_errors=reader_errors,
+            elapsed_seconds=time.monotonic() - start,
+            stop_reason=stop_reason,
+        )
+        self._warmup_stats = stats
+        return stats
+
+    def _warmup_order(self, keys: Sequence[ExpertKey]) -> list[ExpertKey]:
+        """Sort warmup keys by ascending ``(file, offset)`` for sequential reads."""
+
+        def sort_key(key: ExpertKey) -> tuple[str, int]:
+            bundle = self.manifest.expert_bundles[key]
+            first = min(bundle.tensors, key=lambda tensor: (str(tensor.file), tensor.offset))
+            return str(first.file), first.offset
+
+        return sorted(keys, key=sort_key)
 
     def _resolve_resident(self, layer: int, expert: int) -> ResidentExpert:
         key = ExpertKey(layer, expert)

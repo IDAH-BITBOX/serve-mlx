@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import re
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
+from .advisor import parse_startup_io_probe
 from .cache import MemoryBudgetError
 from .config import parse_bytes, parse_resident_budget
 from .errors import MlxMoeStreamError
@@ -16,7 +20,12 @@ from .logging import (
     DEFAULT_LOG_MAX_BYTES,
     configure_logging,
 )
-from .memory import MemoryBudgetConfig, automatic_safety_margin_bytes, collect_memory_snapshot
+from .memory import (
+    MemoryBudgetConfig,
+    adaptive_safety_margin_bytes,
+    automatic_safety_margin_bytes,
+    collect_memory_snapshot,
+)
 from .models import load_streaming_model
 from .prefetch import (
     PredictivePrefetchConfig,
@@ -34,6 +43,7 @@ from .server import (
     is_loopback_host,
     run_local_server,
 )
+from .startup import StartupDecision
 from .storage import build_streaming_manifest
 
 
@@ -106,7 +116,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help=(
             "M7 Unified Memory kept free from expert cache; auto reserves 25%% of physical "
-            "memory (default: auto)"
+            "memory, adaptive reserves 25%% minus what the OS already withheld from "
+            "the recommended working set (default: auto)"
+        ),
+    )
+    generate.add_argument(
+        "--max-unified-memory",
+        help=(
+            "explicit Unified Memory working-set ceiling for the M7 budget, replacing "
+            "the OS-recommended working set; a bare number is GB (for example 14), or "
+            "use a sized value such as 14GiB (default: unset, uses the OS recommendation)"
         ),
     )
     generate.add_argument(
@@ -129,6 +148,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="optional JSON destination for M7 startup, final, and pressure memory metrics",
     )
+    generate.add_argument(
+        "--startup-io-probe",
+        default="auto",
+        help=(
+            "M11 SSD read-bandwidth input for the performance advisor: auto probes "
+            "~53MB from the manifest at startup, off skips probing and uses the M4 "
+            "default (2.0GB/s), or supply an explicit bytes/sec number (default: auto)"
+        ),
+    )
+    _add_startup_options(generate, include_io_probe=False)
     generate.add_argument(
         "--prefill-strategy",
         choices=("expert_major", "token_major"),
@@ -199,7 +228,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help=(
             "M7 Unified Memory kept free from expert cache; auto reserves 25%% of physical "
-            "memory (default: auto)"
+            "memory, adaptive reserves 25%% minus what the OS already withheld from "
+            "the recommended working set (default: auto)"
+        ),
+    )
+    serve.add_argument(
+        "--max-unified-memory",
+        help=(
+            "explicit Unified Memory working-set ceiling for the M7 budget, replacing "
+            "the OS-recommended working set; a bare number is GB (for example 14), or "
+            "use a sized value such as 14GiB (default: unset, uses the OS recommendation)"
         ),
     )
     serve.add_argument(
@@ -214,6 +252,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="M7 transient-workspace reservation (VLM uses at least 2GiB)",
     )
     serve.add_argument("--wired-limit")
+    _add_startup_options(serve, include_io_probe=True)
+    preload_group = serve.add_mutually_exclusive_group()
+    preload_group.add_argument(
+        "--preload",
+        dest="preload",
+        action="store_true",
+        default=None,
+        help=(
+            "M13 activate the default model before serving; default is on for a single "
+            "registered model, off for repeated --model registrations"
+        ),
+    )
+    preload_group.add_argument(
+        "--no-preload",
+        dest="preload",
+        action="store_false",
+        help="M13 never activate a model before the first request",
+    )
     serve.add_argument(
         "--max-prompt-tokens",
         type=int,
@@ -367,6 +423,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 mode=args.kv_cache,
                 max_context_tokens=args.kv_max_context,
             )
+            # Parsed before the (potentially expensive) model load so a bad
+            # --startup-io-probe value fails fast instead of after loading.
+            probe_setting = parse_startup_io_probe(args.startup_io_probe)
             engine = load_streaming_model(
                 args.manifest,
                 resident_budget_bytes=resident_budget,
@@ -380,6 +439,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 async_gpu=args.async_gpu,
                 predictor=predictor,
                 predictive_config=predictive_config,
+                startup_io_probe=probe_setting,
+                warmup=args.warmup,
+                warmup_timeout_seconds=args.warmup_timeout,
             )
             timeline = ()
             final_snapshot = None
@@ -435,6 +497,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 budget.available_expert_bytes,
                 budget.expert_budget_bytes,
             )
+            # Reuse the StartupDecision prepare_streaming_runtime already
+            # computed during load_streaming_model() above (engine.startup_decision)
+            # instead of re-probing bandwidth/hardware and recomputing decide_startup
+            # here. Re-running the M11 advisor after load previously repeated the
+            # ~53MB --startup-io-probe auto read and re-ran probe_hardware, which
+            # could produce a *different* bandwidth reading than the one load already
+            # planned around, making this log and --startup-report disagree with
+            # engine.startup_decision.report.
+            _report_startup_decision(logger, engine, args.startup_report)
             if engine.kv_cache is not None:
                 logger.info(
                     "KV cache: requested=%s effective=%s context=%s estimate=%s reserve=%s",
@@ -516,13 +587,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 minimum_scratch_reserve_bytes=(2 * 1024**3 if args.vision else 0),
             )
             predictor, predictive_config = _predictive_options(args)
-            prefill_step_size = _serve_prefill_step_size(
-                args.prefill_step_size, vision=args.vision
-            )
+            prefill_step_size = _serve_prefill_step_size(args.prefill_step_size, vision=args.vision)
             kv_cache_config = KvCacheConfig(
                 mode=args.kv_cache,
                 max_context_tokens=args.max_prompt_tokens + args.max_tokens,
             )
+            # Parsed before any model can load so a bad --startup-io-probe value
+            # fails fast, matching the M11 `generate` behavior.
+            probe_setting = parse_startup_io_probe(args.startup_io_probe)
             registrations = _serve_registrations(
                 args.manifest,
                 args.model,
@@ -554,10 +626,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     vision=args.vision,
                     predictor=predictor,
                     predictive_config=predictive_config,
+                    startup_io_probe=probe_setting,
+                    warmup=args.warmup,
+                    warmup_timeout_seconds=args.warmup_timeout,
                 ),
             )
             service = LocalGenerationService(config=server_config, registry=registry)
+            preload = _resolve_preload(args.preload, registration_count=len(registrations))
             try:
+                if preload:
+                    engine = registry.activate(default_model_id)
+                    _report_startup_decision(logger, engine, args.startup_report)
                 server = LocalApiServer(
                     args.host,
                     args.port,
@@ -608,9 +687,15 @@ def _memory_config(
     """Resolve one CLI memory policy before the model shell is loaded."""
 
     margin = args.memory_safety_margin
-    if isinstance(margin, str) and margin.lower() == "auto":
+    normalized_margin = margin.lower() if isinstance(margin, str) else None
+    if normalized_margin in ("auto", "adaptive"):
         snapshot = collect_memory_snapshot(include_os_metrics=False)
-        safety_margin_bytes = automatic_safety_margin_bytes(snapshot.physical_memory_bytes)
+        if normalized_margin == "auto":
+            safety_margin_bytes = automatic_safety_margin_bytes(snapshot.physical_memory_bytes)
+        else:
+            safety_margin_bytes = adaptive_safety_margin_bytes(
+                snapshot.physical_memory_bytes, snapshot.recommended_working_set_bytes
+            )
     else:
         safety_margin_bytes = parse_bytes(margin)
     scratch_reserve_bytes = max(parse_bytes(args.scratch_reserve), minimum_scratch_reserve_bytes)
@@ -619,7 +704,27 @@ def _memory_config(
         kv_reserve_bytes=parse_bytes(args.kv_reserve),
         scratch_reserve_bytes=scratch_reserve_bytes,
         wired_limit_bytes=(parse_bytes(args.wired_limit) if args.wired_limit else None),
+        explicit_working_set_bytes=_parse_max_unified_memory_bytes(
+            getattr(args, "max_unified_memory", None)
+        ),
     )
+
+
+def _parse_max_unified_memory_bytes(value: str | None) -> int | None:
+    """Parse --max-unified-memory: a bare number means gigabytes.
+
+    Reuses the same ``parse_bytes`` size grammar as --kv-reserve/--scratch-reserve
+    for anything that is not a bare number (for example ``14GiB``), so both
+    ``--max-unified-memory 12`` (= 12GB) and ``--max-unified-memory 12GiB``
+    are accepted.
+    """
+
+    if value is None:
+        return None
+    stripped = value.strip()
+    if re.fullmatch(r"\d+(\.\d+)?", stripped):
+        return parse_bytes(f"{stripped}GB")
+    return parse_bytes(stripped)
 
 
 def _serve_resident_budget(value: str | None, *, vision: bool) -> tuple[int | None, bool]:
@@ -652,6 +757,99 @@ def _add_kv_cache_options(parser: argparse.ArgumentParser, *, include_max_contex
             type=int,
             default=4_096,
             help="largest context to reserve KV cache for (default: 4096)",
+        )
+
+
+def _add_startup_options(parser: argparse.ArgumentParser, *, include_io_probe: bool) -> None:
+    """M13 warmup/report flags shared by ``generate`` and ``serve``.
+
+    ``generate`` already declares its own ``--startup-io-probe`` (with M11
+    wording specific to that command), so ``include_io_probe`` lets ``serve``
+    opt into the same flag here instead of duplicating its help text.
+    """
+
+    if include_io_probe:
+        parser.add_argument(
+            "--startup-io-probe",
+            default="auto",
+            help=(
+                "M11 SSD read-bandwidth input for the performance advisor: auto probes "
+                "~53MB from the manifest at startup, off skips probing and uses the M4 "
+                "default (2.0GB/s), or supply an explicit bytes/sec number (default: auto)"
+            ),
+        )
+    parser.add_argument(
+        "--warmup",
+        choices=("auto", "off"),
+        default="auto",
+        help=(
+            "M13 startup expert-cache warmup: auto preloads every expert bundle when the "
+            "resident cache can hold the full working set (full_residency mode); off never "
+            "warms, regardless of mode (default: auto)"
+        ),
+    )
+    parser.add_argument(
+        "--warmup-timeout",
+        type=float,
+        default=300.0,
+        help="maximum seconds the M13 startup warmup may run before returning partial progress "
+        "(default: 300); this is a soft deadline checked once per bundle between reads, not a "
+        "preemptive cutoff, so the actual run can overshoot it by up to one bundle's own "
+        "read+materialize+eval time",
+    )
+    parser.add_argument(
+        "--startup-report",
+        type=Path,
+        help="optional JSON destination for the M13 startup mode/budget/advisory report",
+    )
+
+
+def _resolve_preload(explicit: bool | None, *, registration_count: int) -> bool:
+    """M13 ``--preload``/``--no-preload`` default: on for one model, off for several.
+
+    An explicit ``--preload``/``--no-preload`` always wins; ``explicit`` is
+    ``None`` only when neither flag was passed.
+    """
+
+    if explicit is not None:
+        return explicit
+    return registration_count == 1
+
+
+def _report_startup_decision(
+    logger: logging.Logger, engine: Any, startup_report_path: Path | None
+) -> None:
+    """Log the M11 advisory for an already-loaded engine and dump ``--startup-report``.
+
+    Reuses the ``StartupDecision`` ``prepare_streaming_runtime`` already
+    computed and stored on ``engine.startup_decision`` -- this never reruns
+    the M11 advisor or the M7 hardware probe. A bare ``StreamingEngine``-like
+    object without that attribute (for example an older or hand-built fake in
+    a test) simply skips this reporting.
+    """
+
+    decision: StartupDecision | None = getattr(engine, "startup_decision", None)
+    if decision is None:
+        return
+    report = decision.report
+    logger.info(
+        "M11 performance advisor (bandwidth source=%s): %s",
+        report.get("bandwidth_source"),
+        report.get("log_line"),
+    )
+    if report.get("wired_limit_suggestion"):
+        logger.info("M11 suggestion: %s", report["wired_limit_suggestion"])
+    if report.get("double_deduction_suggestion"):
+        logger.info("M11 suggestion: %s", report["double_deduction_suggestion"])
+    if startup_report_path is not None:
+        # allow_nan=False: inf is not valid JSON. advisor.py already clamps a
+        # full_residency decode_ceiling_tps to None before it reaches this
+        # report, but this is the belt to that suspender -- any future
+        # non-finite value fails loudly here instead of writing invalid JSON
+        # to disk.
+        startup_report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True, default=str, allow_nan=False),
+            encoding="utf-8",
         )
 
 

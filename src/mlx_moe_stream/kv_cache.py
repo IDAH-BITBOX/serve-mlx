@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
@@ -120,12 +121,7 @@ def memory_config_with_kv_reserve(
     """Return M7 settings with enough KV reservation for the selected policy."""
 
     base = config or MemoryBudgetConfig()
-    return MemoryBudgetConfig(
-        safety_margin_bytes=base.safety_margin_bytes,
-        kv_reserve_bytes=decision.reserve_bytes,
-        scratch_reserve_bytes=base.scratch_reserve_bytes,
-        wired_limit_bytes=base.wired_limit_bytes,
-    )
+    return dataclasses.replace(base, kv_reserve_bytes=decision.reserve_bytes)
 
 
 def make_memory_manager(
