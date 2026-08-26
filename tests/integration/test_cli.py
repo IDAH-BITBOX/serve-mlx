@@ -90,12 +90,13 @@ def test_serve_registers_multiple_models_without_loading_them(
 ):
     seen = []
 
-    def stop_immediately(server):
+    def stop_immediately(server, **kwargs):
+        del kwargs
         seen.append(server.service)
 
     class FakeServer:
-        def __init__(self, host, port, service):
-            del host, port
+        def __init__(self, host, port, service, **kwargs):
+            del host, port, kwargs
             self.service = service
             self.server_address = ("127.0.0.1", 8000)
 
