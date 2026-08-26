@@ -11,7 +11,11 @@ from .cache import MemoryBudgetError
 from .config import parse_bytes, parse_resident_budget
 from .errors import MlxMoeStreamError
 from .kv_cache import KvCacheConfig
-from .logging import configure_logging
+from .logging import (
+    DEFAULT_LOG_BACKUP_COUNT,
+    DEFAULT_LOG_MAX_BYTES,
+    configure_logging,
+)
 from .memory import MemoryBudgetConfig, automatic_safety_margin_bytes, collect_memory_snapshot
 from .models import load_streaming_model
 from .prefetch import (
@@ -21,6 +25,7 @@ from .prefetch import (
 )
 from .routing import load_trace, summarize_trace, trace_qwen3_generation, write_summary
 from .server import (
+    DEFAULT_CONNECTION_TIMEOUT,
     LocalApiServer,
     LocalGenerationService,
     ModelRegistration,
@@ -253,6 +258,39 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--io-workers", type=int, default=0)
     serve.add_argument("--prefetch-depth", type=int, default=1)
     serve.add_argument("--async-gpu", action="store_true")
+    serve.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="also write rotating logs here instead of relying on shell redirection",
+    )
+    serve.add_argument(
+        "--log-max-bytes",
+        type=int,
+        default=DEFAULT_LOG_MAX_BYTES,
+        help=f"rotate --log-file above this size (default: {DEFAULT_LOG_MAX_BYTES})",
+    )
+    serve.add_argument(
+        "--log-backups",
+        type=int,
+        default=DEFAULT_LOG_BACKUP_COUNT,
+        help=f"rotated --log-file copies to keep (default: {DEFAULT_LOG_BACKUP_COUNT})",
+    )
+    serve.add_argument(
+        "--pid-file",
+        type=Path,
+        default=None,
+        help="write the server pid here and remove it on a clean shutdown",
+    )
+    serve.add_argument(
+        "--connection-timeout",
+        type=float,
+        default=DEFAULT_CONNECTION_TIMEOUT,
+        help=(
+            "seconds a single socket operation may block; 0 disables the timeout "
+            f"(default: {DEFAULT_CONNECTION_TIMEOUT:g})"
+        ),
+    )
     _add_predictive_prefetch_options(serve)
     return parser
 
@@ -260,7 +298,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    logger = configure_logging(args.verbose)
+    logger = configure_logging(
+        args.verbose,
+        log_file=getattr(args, "log_file", None),
+        max_bytes=getattr(args, "log_max_bytes", DEFAULT_LOG_MAX_BYTES),
+        backup_count=getattr(args, "log_backups", DEFAULT_LOG_BACKUP_COUNT),
+    )
     try:
         if args.command == "trace":
             tracer = trace_qwen3_generation(
@@ -519,6 +562,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.host,
                     args.port,
                     service,
+                    connection_timeout=args.connection_timeout or None,
                 )
                 bound_host, bound_port = server.server_address[:2]
                 logger.info(
@@ -529,7 +573,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     bound_host,
                     bound_port,
                 )
-                run_local_server(server)
+                run_local_server(server, pid_file=args.pid_file)
             finally:
                 service.close()
             return 0

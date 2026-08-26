@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import signal
+import sys
 import threading
 import time
 import urllib.request
 import uuid
 from collections.abc import Callable, Iterator
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -161,6 +165,56 @@ class _ActiveGeneration:
     completion_tokens: int = 0
     stopped: bool = False
     settled: bool = False
+
+
+#: Seconds a single socket operation may block.  Without a timeout a keep-alive
+#: client that connects and never speaks holds the only request thread forever,
+#: which is indistinguishable from a hung server.
+DEFAULT_CONNECTION_TIMEOUT = 120.0
+
+#: Socket failures that mean "the peer is gone", not "the server is broken".
+DISCONNECT_ERRORS = (
+    BrokenPipeError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    TimeoutError,
+)
+
+
+class _GenerationStream:
+    """SSE event iterator that frees the generation slot even if it never starts.
+
+    ``completion_events`` reserves the slot eagerly so a busy server can answer
+    429 before any SSE header is written, but the generator that releases the
+    slot only runs on the first ``next()``.  A client that disconnects in between
+    would otherwise strand the slot, and every later request would be rejected as
+    busy for the lifetime of the process.  Closing this wrapper always settles
+    the generation, started or not.
+    """
+
+    def __init__(
+        self, events: Iterator[dict[str, Any]], abandon: Callable[[], None]
+    ) -> None:
+        self._events = events
+        self._abandon: Callable[[], None] | None = abandon
+        self._started = False
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        # Once the generator body owns the slot its own handlers settle it.
+        self._started = True
+        self._abandon = None
+        return next(self._events)
+
+    def close(self) -> None:
+        if self._started:
+            self._events.close()
+            return
+        abandon, self._abandon = self._abandon, None
+        if abandon is not None:
+            abandon()
 
 
 class LocalGenerationService:
@@ -332,7 +386,9 @@ class LocalGenerationService:
             endpoint="completion",
             prompt_builder=lambda _: _Prompt(prompt),
         )
-        return self._completion_events(active)
+        return _GenerationStream(
+            self._completion_events(active), lambda: self._fail_generation(active)
+        )
 
     def chat_completion_events(self, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
         options = self._options(payload, endpoint="chat_completion")
@@ -348,7 +404,9 @@ class LocalGenerationService:
             endpoint="chat_completion",
             prompt_builder=lambda engine: self._chat_prompt(messages, engine, options),
         )
-        return self._chat_events(active)
+        return _GenerationStream(
+            self._chat_events(active), lambda: self._fail_generation(active)
+        )
 
     def _options(self, payload: dict[str, Any], *, endpoint: Endpoint) -> GenerationOptions:
         return parse_generation_options(
@@ -831,9 +889,40 @@ class LocalApiServer(HTTPServer):
 
     allow_reuse_address = True
 
-    def __init__(self, host: str, port: int, service: LocalGenerationService) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        service: LocalGenerationService,
+        *,
+        connection_timeout: float | None = DEFAULT_CONNECTION_TIMEOUT,
+    ) -> None:
         self.service = service
+        self.connection_timeout = connection_timeout
         super().__init__((host, port), _RequestHandler)
+
+    def finish_request(self, request: Any, client_address: Any) -> None:
+        if self.connection_timeout is not None:
+            request.settimeout(self.connection_timeout)
+        super().finish_request(request, client_address)
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        """Route transport failures through logging instead of raw stderr.
+
+        The stdlib prints a full traceback straight to ``sys.stderr``, bypassing
+        the configured handlers and formatting.  A client hanging up is normal
+        and deserves one line, not a stack trace.
+        """
+
+        error = sys.exc_info()[1]
+        if isinstance(error, DISCONNECT_ERRORS):
+            LOGGER.info(
+                "M11 connection from %s closed early (%s)",
+                client_address,
+                type(error).__name__,
+            )
+            return
+        LOGGER.exception("M11 unhandled error while serving %s", client_address)
 
 
 class _RequestHandler(BaseHTTPRequestHandler):
@@ -842,14 +931,18 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
         path = urlparse(self.path).path
-        if path == "/health":
-            self._send_json(HTTPStatus.OK, self.server.service.health())
-        elif path == "/v1/models":
-            self._send_json(HTTPStatus.OK, self.server.service.models())
-        elif path == "/metrics":
-            self._send_json(HTTPStatus.OK, self.server.service.metrics_snapshot())
-        else:
-            self._send_error(HTTPStatus.NOT_FOUND, "endpoint not found", code="not_found")
+        try:
+            if path == "/health":
+                self._send_json(HTTPStatus.OK, self.server.service.health())
+            elif path == "/v1/models":
+                self._send_json(HTTPStatus.OK, self.server.service.models())
+            elif path == "/metrics":
+                self._send_json(HTTPStatus.OK, self.server.service.metrics_snapshot())
+            else:
+                self._send_error(HTTPStatus.NOT_FOUND, "endpoint not found", code="not_found")
+        except Exception:  # pragma: no cover - defensive boundary for a live server
+            LOGGER.exception("M11 GET %s failed", path)
+            self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "internal server error")
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
         path = urlparse(self.path).path
@@ -906,41 +999,58 @@ class _RequestHandler(BaseHTTPRequestHandler):
         return payload
 
     def _send_sse(self, events: Iterator[dict[str, Any]]) -> None:
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
+        # ``closing`` settles the generation on every exit path, including a
+        # disconnect that happens before the first event is ever pulled.
+        with closing(events):
+            self.close_connection = True
+            try:
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+            except DISCONNECT_ERRORS as error:
+                LOGGER.info(
+                    "M11 SSE client disconnected before the stream started (%s)",
+                    type(error).__name__,
+                )
+                return
+            try:
+                for event in events:
+                    self._send_sse_data(event)
+            except ApiRequestError as error:
+                self._try_send_sse_error(
+                    _error_payload(
+                        error.status, str(error), parameter=error.parameter, code=error.code
+                    )
+                )
+            except MemoryPressureError as error:
+                self._try_send_sse_error(
+                    _error_payload(
+                        HTTPStatus.SERVICE_UNAVAILABLE, str(error), code="memory_pressure"
+                    )
+                )
+            except DISCONNECT_ERRORS as error:
+                LOGGER.info("M11 SSE client disconnected (%s)", type(error).__name__)
+                return
+            except Exception:  # pragma: no cover - defensive live transport boundary
+                LOGGER.exception("M11 SSE request failed")
+                self._try_send_sse_error(
+                    _error_payload(HTTPStatus.INTERNAL_SERVER_ERROR, "internal server error")
+                )
+            try:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except DISCONNECT_ERRORS:
+                LOGGER.info("M11 SSE client disconnected before [DONE]")
+
+    def _try_send_sse_error(self, payload: dict[str, Any]) -> None:
+        """Deliver a terminal SSE error, tolerating an already-closed peer."""
+
         try:
-            for event in events:
-                self._send_sse_data(event)
-        except ApiRequestError as error:
-            self._send_sse_data(
-                _error_payload(
-                    error.status, str(error), parameter=error.parameter, code=error.code
-                ),
-                event="error",
-            )
-        except MemoryPressureError as error:
-            self._send_sse_data(
-                _error_payload(HTTPStatus.SERVICE_UNAVAILABLE, str(error), code="memory_pressure"),
-                event="error",
-            )
-        except (BrokenPipeError, ConnectionResetError):
-            LOGGER.info("M11 SSE client disconnected")
-            return
-        except Exception:  # pragma: no cover - defensive live transport boundary
-            LOGGER.exception("M11 SSE request failed")
-            self._send_sse_data(
-                _error_payload(HTTPStatus.INTERNAL_SERVER_ERROR, "internal server error"),
-                event="error",
-            )
-        try:
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            LOGGER.info("M11 SSE client disconnected before [DONE]")
+            self._send_sse_data(payload, event="error")
+        except DISCONNECT_ERRORS:
+            LOGGER.info("M11 SSE client disconnected before the error was delivered")
 
     def _send_sse_data(self, payload: dict[str, Any], *, event: str | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -961,11 +1071,19 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except DISCONNECT_ERRORS as error:
+            # A client that hangs up mid-response is routine, not a server fault.
+            self.close_connection = True
+            LOGGER.info(
+                "M11 client disconnected before the response was sent (%s)",
+                type(error).__name__,
+            )
 
     def log_message(self, format: str, *args: Any) -> None:
         LOGGER.debug("M11 HTTP %s", format % args)
@@ -977,15 +1095,42 @@ def is_loopback_host(host: str) -> bool:
     return host in {"127.0.0.1", "localhost"}
 
 
-def run_local_server(server: LocalApiServer) -> None:
-    """Serve until Ctrl-C, always closing the listening socket afterwards."""
+def run_local_server(server: LocalApiServer, *, pid_file: Path | None = None) -> None:
+    """Serve until interrupted or signalled, always releasing the socket after.
+
+    ``SIGTERM`` is what a process manager, a shutdown, or ``pkill`` sends.  Without
+    a handler the process dies mid-request with no chance to close the listening
+    socket or drop its pid file, so the next start can collide with a stale port.
+    """
+
+    if pid_file is not None:
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    def _request_shutdown(signum: int, _frame: Any) -> None:
+        LOGGER.info("M11 received %s; shutting down", signal.Signals(signum).name)
+        # shutdown() blocks until serve_forever() returns, so it must not run on
+        # the thread that is currently inside serve_forever().
+        threading.Thread(target=server.shutdown, name="mlx-moe-shutdown", daemon=True).start()
+
+    installed: dict[int, Any] = {}
+    for number in (signal.SIGTERM, signal.SIGINT):
+        try:
+            installed[number] = signal.signal(number, _request_shutdown)
+        except ValueError:  # pragma: no cover - not on the main thread
+            LOGGER.debug("M11 could not install a handler for %s", number)
 
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
+    except KeyboardInterrupt:  # pragma: no cover - interactive interrupt
         LOGGER.info("M11 server interrupted")
     finally:
+        for number, previous in installed.items():
+            signal.signal(number, previous)
         server.server_close()
+        if pid_file is not None:
+            pid_file.unlink(missing_ok=True)
+        LOGGER.info("M11 server stopped")
 
 
 def _completion_chunk(
