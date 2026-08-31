@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
 from mlx_moe_stream.errors import MemoryPressureError
 from mlx_moe_stream.server import (
     LocalApiServer,
@@ -605,6 +606,22 @@ def test_http_endpoints_return_openai_json(
         health = _get_json(f"{base_url}/health")
         assert health["status"] == "ok"
         assert _get_json(f"{base_url}/v1/models")["data"][0]["id"] == "test-moe"
+        assert _get_json(f"{base_url}/v1/models/test-moe") == {
+            "id": "test-moe",
+            "object": "model",
+            "created": 0,
+            "owned_by": "local",
+        }
+        ollama_model = _post_json(f"{base_url}/api/show", {"name": "test-moe"})
+        assert ollama_model["details"] == {
+            "parent_model": "",
+            "format": "mlx",
+            "family": "local",
+            "families": ["local"],
+            "parameter_size": "unknown",
+            "quantization_level": "unknown",
+        }
+        assert ollama_model["capabilities"] == ["completion", "tools"]
         response = _post_json(
             f"{base_url}/v1/chat/completions",
             {"model": "test-moe", "messages": [{"role": "user", "content": "hello"}]},

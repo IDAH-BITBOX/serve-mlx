@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import mlx.core as mx
 from mlx_lm import stream_generate
@@ -266,14 +266,77 @@ class LocalGenerationService:
         return {
             "object": "list",
             "data": [
-                {
-                    "id": registration.model_id,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "local",
-                }
-                for registration in self.registry.registrations()
+                self._openai_model(registration) for registration in self.registry.registrations()
             ],
+        }
+
+    def model(self, model_id: str) -> dict[str, Any]:
+        """Return one OpenAI model object without loading its engine."""
+
+        registration = self._registration(model_id)
+        return self._openai_model(registration)
+
+    def ollama_show(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Return the small Ollama ``/api/show`` shape used by Hermes.
+
+        Desktop clients commonly probe both OpenAI and Ollama endpoints while
+        discovering a local provider.  Reading the prepared manifest is cheap
+        and, unlike activating a model, does not allocate MLX Unified Memory.
+        """
+
+        name = payload.get("name", payload.get("model"))
+        if not isinstance(name, str) or not name:
+            raise ApiRequestError("'name' must name a registered local model", parameter="name")
+        registration = self._registration(name)
+        metadata = _manifest_metadata(registration.manifest_path)
+        source_model = metadata.get("source_model", registration.model_id)
+        model_type = metadata.get("model_type", "local")
+        if not isinstance(source_model, str):
+            source_model = registration.model_id
+        if not isinstance(model_type, str):
+            model_type = "local"
+
+        quantization = metadata.get("quantization")
+        bits = quantization.get("bits") if isinstance(quantization, dict) else None
+        quantization_level = f"Q{bits}" if isinstance(bits, int) else "unknown"
+        return {
+            "modelfile": f"FROM {source_model}\n",
+            "parameters": "",
+            "template": "",
+            "details": {
+                "parent_model": "",
+                "format": "mlx",
+                "family": model_type,
+                "families": [model_type],
+                "parameter_size": _parameter_size(source_model),
+                "quantization_level": quantization_level,
+            },
+            "model_info": {
+                "general.architecture": model_type,
+                "general.quantization_version": bits,
+                "mlx.source_model": source_model,
+            },
+            "capabilities": ["completion", "tools"],
+        }
+
+    def _registration(self, model_id: str) -> ModelRegistration:
+        for registration in self.registry.registrations():
+            if registration.model_id == model_id:
+                return registration
+        raise ApiRequestError(
+            f"unknown local model {model_id!r}",
+            status=HTTPStatus.NOT_FOUND,
+            parameter="model",
+            code="model_not_found",
+        )
+
+    @staticmethod
+    def _openai_model(registration: ModelRegistration) -> dict[str, Any]:
+        return {
+            "id": registration.model_id,
+            "object": "model",
+            "created": 0,
+            "owned_by": "local",
         }
 
     def metrics_snapshot(self) -> dict[str, Any]:
@@ -933,17 +996,43 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, self.server.service.health())
             elif path == "/v1/models":
                 self._send_json(HTTPStatus.OK, self.server.service.models())
+            elif path.startswith("/v1/models/"):
+                model_id = unquote(path.removeprefix("/v1/models/"))
+                self._send_json(HTTPStatus.OK, self.server.service.model(model_id))
             elif path == "/metrics":
                 self._send_json(HTTPStatus.OK, self.server.service.metrics_snapshot())
-            else:
-                self._send_error(HTTPStatus.NOT_FOUND, "endpoint not found", code="not_found")
+        except ApiRequestError as error:
+            self._send_error(error.status, str(error), parameter=error.parameter, code=error.code)
         except Exception:  # pragma: no cover - defensive boundary for a live server
             LOGGER.exception("M11 GET %s failed", path)
             self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "internal server error")
+        else:
+            if path not in {
+                "/health",
+                "/v1/models",
+                "/metrics",
+            } and not path.startswith("/v1/models/"):
+                self._send_error(HTTPStatus.NOT_FOUND, "endpoint not found", code="not_found")
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
         path = urlparse(self.path).path
+        if path == "/api/show":
+            try:
+                payload = self.server.service.ollama_show(self._read_json_body())
+                self._send_json(HTTPStatus.OK, payload)
+            except ApiRequestError as error:
+                self._send_error(
+                    error.status, str(error), parameter=error.parameter, code=error.code
+                )
+            except Exception:  # pragma: no cover - defensive boundary for a live server
+                LOGGER.exception("M11 Ollama model discovery failed")
+                self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "internal server error")
+            return
         if path not in {"/v1/completions", "/v1/chat/completions"}:
+            # A 404 still has a request body in many Ollama-compatible probes.
+            # Closing this HTTP/1.1 connection prevents those unread bytes from
+            # being parsed as a spurious next request by BaseHTTPRequestHandler.
+            self.close_connection = True
             self._send_error(HTTPStatus.NOT_FOUND, "endpoint not found", code="not_found")
             return
         try:
@@ -1210,3 +1299,23 @@ def _error_payload(
             "code": code,
         }
     }
+
+
+def _manifest_metadata(path: Path) -> dict[str, Any]:
+    """Read optional prepared-model metadata without activating the engine."""
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _parameter_size(source_model: str) -> str:
+    """Best-effort parameter-size label for Ollama-compatible model discovery."""
+
+    for part in source_model.replace("/", "-").split("-"):
+        candidate = part.upper()
+        if candidate.endswith(("B", "M")) and candidate[:-1].replace(".", "", 1).isdigit():
+            return candidate
+    return "unknown"
