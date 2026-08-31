@@ -161,8 +161,13 @@ def normalize_messages(messages: Any) -> list[Message]:
         if not isinstance(message, dict):
             raise ApiRequestError(f"messages[{index}] must be an object", parameter="messages")
         role = message.get("role")
-        if role not in {"system", "user", "assistant", "tool"}:
+        if role not in {"system", "developer", "user", "assistant", "tool"}:
             raise ApiRequestError(f"messages[{index}].role is unsupported", parameter="messages")
+        # Hermes and current OpenAI clients can put the instruction message in
+        # the newer ``developer`` role.  The local Qwen/Gemma templates use
+        # ``system``, whose instruction semantics are equivalent here.
+        if role == "developer":
+            role = "system"
         content = message.get("content")
         if content is None and role == "assistant":
             content = ""
@@ -766,9 +771,10 @@ def _parse_response_format(value: Any) -> dict[str, Any] | None:
 
 
 def _parse_reasoning_effort(value: Any) -> str:
-    if value not in {"none", "low", "medium", "high"}:
+    if value not in {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
         raise ApiRequestError(
-            "reasoning_effort must be one of none, low, medium, or high",
+            "reasoning_effort must be one of none, minimal, low, medium, high, "
+            "xhigh, max, or ultra",
             parameter="reasoning_effort",
         )
     return value

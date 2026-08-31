@@ -62,6 +62,7 @@ class ServerConfig:
     max_completion_tokens: int = 256
     max_request_bytes: int = 1_000_000
     prefill_step_size: int = 2_048
+    vision_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not self.model_id:
@@ -299,6 +300,11 @@ class LocalGenerationService:
         quantization = metadata.get("quantization")
         bits = quantization.get("bits") if isinstance(quantization, dict) else None
         quantization_level = f"Q{bits}" if isinstance(bits, int) else "unknown"
+        capabilities = ["completion", "tools"]
+        if model_type.startswith("qwen"):
+            capabilities.append("thinking")
+        if self.config.vision_enabled:
+            capabilities.append("vision")
         return {
             "modelfile": f"FROM {source_model}\n",
             "parameters": "",
@@ -316,7 +322,7 @@ class LocalGenerationService:
                 "general.quantization_version": bits,
                 "mlx.source_model": source_model,
             },
-            "capabilities": ["completion", "tools"],
+            "capabilities": capabilities,
         }
 
     def _registration(self, model_id: str) -> ModelRegistration:

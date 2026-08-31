@@ -688,6 +688,39 @@ def test_http_sse_streams_openai_chunks_and_done(service: LocalGenerationService
         worker.join(timeout=2)
 
 
+def test_ollama_show_reports_qwen_thinking_and_enabled_vision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "source_model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+                "model_type": "qwen3_5_moe",
+                "quantization": {"bits": 4},
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "mlx_moe_stream.server.app.stream_generate",
+        lambda *_args, **_kwargs: iter(()),
+    )
+    registry = ModelRegistry(
+        [ModelRegistration("qwen", manifest)],
+        load_engine=lambda _path: _Engine(),
+    )
+    service = LocalGenerationService(
+        config=ServerConfig(model_id="qwen", vision_enabled=True), registry=registry
+    )
+
+    show = service.ollama_show({"name": "qwen"})
+
+    assert show["details"]["parameter_size"] == "35B"
+    assert show["details"]["quantization_level"] == "Q4"
+    assert show["capabilities"] == ["completion", "tools", "thinking", "vision"]
+    assert registry.snapshot()["active_model_id"] is None
+
+
 def test_registry_lazily_switches_models_without_two_active_engines(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):

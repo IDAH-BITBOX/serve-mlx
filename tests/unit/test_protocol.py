@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import pytest
+
 from mlx_moe_stream.server.protocol import (
     ThinkingStreamParser,
     ToolCallStreamParser,
+    normalize_messages,
+    parse_generation_options,
     parse_tool_calls,
     split_reasoning,
 )
@@ -54,3 +58,24 @@ def test_gemma_native_tool_call_is_withheld_until_its_end_marker():
     assert second[0][0] == "tool_calls"
     assert second[0][1][0]["function"]["name"] == "get_weather"
     assert second[1:] == [("content", " after")]
+
+
+def test_hermes_developer_instruction_normalizes_to_system_message():
+    assert normalize_messages([{"role": "developer", "content": "Follow this policy."}]) == [
+        {"role": "system", "content": "Follow this policy."}
+    ]
+
+
+@pytest.mark.parametrize(
+    "effort", ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+)
+def test_hermes_reasoning_effort_range_is_accepted(effort: str):
+    options = parse_generation_options(
+        {"model": "qwen", "reasoning_effort": effort},
+        endpoint="chat_completion",
+        default_model_id="qwen",
+        model_exists=lambda model: model == "qwen",
+        max_completion_tokens=256,
+    )
+
+    assert options.reasoning_effort == effort

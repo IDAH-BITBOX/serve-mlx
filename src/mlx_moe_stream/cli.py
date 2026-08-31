@@ -609,6 +609,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_completion_tokens=args.max_tokens,
                 max_request_bytes=parse_bytes(args.max_request_bytes),
                 prefill_step_size=prefill_step_size,
+                vision_enabled=args.vision,
             )
             registry = ModelRegistry(
                 registrations,
